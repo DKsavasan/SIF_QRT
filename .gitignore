@@ -1,0 +1,7 @@
+local_data/data/
+__pycache__/
+.venv/
+.DS_Store
+logs/
+qsec-client/
+target_files/
