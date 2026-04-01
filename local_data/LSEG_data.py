@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(_SCRIPT_DIR, 'data')
 PRICE_DATA_OUTPUT_DIR = os.path.join(_SCRIPT_DIR, 'data', 'lseg')
-INDEX_NAME_MAPPING = {'RAY': '.RUA', 'SXXP': '.STOXX50E'}
+INDEX_NAME_MAPPING = {'RAY': '.SPX', 'SXXP': '.STOXX50E'}
 BB_COLUMN_RENAME = {'ISIN\n': 'ISIN', 'Sec Type\n': 'SecType'}
 DAILY_DATA_FIELDS = ["TR.PriceClose", "TR.Volume"]
 
@@ -27,7 +27,7 @@ def get_data(instruments: list, fields: list = ["TR.PrimaryRIC", "TR.ISIN", "TR.
     ld.open_session()
     try:
         return ld.get_data(
-            universe=instruments,  # RIC'S or ISIN's: ['0#.STOXX', '0#.RUA']
+            universe=instruments,  # RIC'S or ISIN's: ['0#.STOXX', '0#.SPX']
             fields=fields,
             parameters={"SDate": '2002-01-31'}
         )
@@ -221,7 +221,7 @@ def _get_batch_data_lseg_RICs(instruments: list, batch: int = 1000) -> pd.DataFr
     
     return df
 
-def update_isin_ric_mapping(out_file: str, indices: list = ['0#.RUA', '0#.STOXX']):
+def update_isin_ric_mapping(out_file: str, indices: list = ['0#.SPX', '0#.STOXX']):
     """
     Fetch LSEG RICs for a list of ISINs and save the mapping to a CSV.
 
@@ -422,13 +422,13 @@ def get_historical_index_constituents():
 def get_current_index_constituents():
     """Fetch RIC's for the currently listed stocks of Russell3000 and STOXX600 from LSEG"""
     stoxx = get_data(['0#.STOXX'])
-    rua = get_data(['0#.RUA'])
+    rua = get_data(['0#.SPX'])
     stoxx_df = stoxx.drop_duplicates(subset=['Instrument']).reset_index(drop=True).rename(columns={'Instrument': 'RIC'})
     rua_df = rua.drop_duplicates(subset=['Instrument']).reset_index(drop=True).rename(columns={'Instrument': 'RIC'})
 
     return pd.concat([stoxx_df, rua_df], axis=0).reset_index(drop=True)
 
-def get_timeseries(data: pd.DataFrame, value_col: str = 'Close', index: str = '.RUA'):
+def get_timeseries(data: pd.DataFrame, value_col: str = 'Close', index: str = '.SPX'):
     """All data for stocks while they were listed in the index, plus the index itself."""
     isin_ric_mapping = pd.read_csv(os.path.join(DATA_DIR, 'isin_ric_mapping.csv'))
     bb_index_constituents = pd.read_csv(os.path.join(DATA_DIR, 'bloomberg_index_constituents.csv'))
@@ -463,7 +463,7 @@ def get_timeseries(data: pd.DataFrame, value_col: str = 'Close', index: str = '.
     
     return df
 
-def eligible_to_trade(prices_df: pd.DataFrame, vol_df: pd.DataFrame, adv_threshold: float = 5e6, index: str = '.RUA') -> pd.DataFrame:
+def eligible_to_trade(prices_df: pd.DataFrame, vol_df: pd.DataFrame, adv_threshold: float = 5e6, index: str = '.SPX') -> pd.DataFrame:
     """Boolean DataFrame, True where stock has sufficient liquidity to trade.
     ADV = rolling 60-day mean of currency volume (Close * Volume)."""
     
@@ -487,7 +487,7 @@ if __name__ == '__main__':
     
     def get_price_data_for_rics_in_mapping_file():
         stoxx = get_data(['0#.STOXX'])
-        rua = get_data(['0#.RUA'])
+        rua = get_data(['0#.SPX'])
 
         stoxx['Instrument'].drop_duplicates().reset_index(drop=True)
         rua['Instrument'].drop_duplicates().reset_index(drop=True)
@@ -513,7 +513,7 @@ if __name__ == '__main__':
         
         traded_instruments = sorted(list(set(isin_ric_mapping).union(set(existing_rics))))
 
-        all_instruments = traded_instruments + ['.RUA', '.STOXX', '.STOXX50E']
+        all_instruments = traded_instruments + ['.SPX', '.STOXX', '.STOXX50E']
 
         # last_date_of_data = pd.read_parquet(f"data/lseg/RIC=.STOXX50E").dropna(subset=['Close']).iloc[-1].Date
         download_all(

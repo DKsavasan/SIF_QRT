@@ -45,9 +45,9 @@ def send_new_portfolio(targets: pd.DataFrame, region: Literal['AMER', 'EMEA']):
         logging.error(f"Failed to send portfolio: {e}")
         raise
 
-def beta(ric: str, market: Literal['.RUA', '.STOXX50E']) -> float | None:
+def beta(ric: str, market: Literal['.SPX', '.STOXX50E']) -> float | None:
     """The QRT calculation for the market beta of a stock"""
-    if ric in ['.RUA', '.STOXX50E']:
+    if ric in ['.SPX', '.STOXX50E']:
         return 1.0
 
     stock_return = pd.read_parquet(os.path.join(PRICE_DIR, f"RIC={ric}")).set_index("Date")['Close'].dropna().pct_change().tail(250).dropna()
@@ -65,7 +65,7 @@ def beta(ric: str, market: Literal['.RUA', '.STOXX50E']) -> float | None:
     # QRT beta calculation
     return 0.2 + 0.8 * float(beta_value)
 
-def portfolio_beta(positions: pd.Series, market: Literal['.RUA', '.STOXX50E']) -> float:
+def portfolio_beta(positions: pd.Series, market: Literal['.SPX', '.STOXX50E']) -> float:
     weights = positions / positions.abs().sum()
     total = 0.0
     for ric in positions.index:
@@ -76,7 +76,7 @@ def portfolio_beta(positions: pd.Series, market: Literal['.RUA', '.STOXX50E']) -
         total += weights[ric] * b
     return total
 
-def forced_hedge(positions: pd.Series, market: Literal['.RUA', '.STOXX50E']) -> float:
+def forced_hedge(positions: pd.Series, market: Literal['.SPX', '.STOXX50E']) -> float:
     """Nominal currency to hedge against beta exposure"""
     hedge = -portfolio_beta(positions, market) * positions.abs().sum()
     if abs(hedge) < 0.01:
@@ -152,7 +152,7 @@ def load_returns_from(rics: pd.Index | list, start: str = '2026-01-01') -> pd.Da
 
     return returns_df_clean
 
-def plot_portfolio_returns(positions: pd.Series, market: Literal['.RUA', '.STOXX50E'], start_date: str = '2026-01-01', benchmark: pd.Series = None, figsize=(10, 5)):
+def plot_portfolio_returns(positions: pd.Series, market: Literal['.SPX', '.STOXX50E'], start_date: str = '2026-01-01', benchmark: pd.Series = None, figsize=(10, 5)):
     """Plot cumulative portfolio returns (%) since start_date.
 
     Parameters:
