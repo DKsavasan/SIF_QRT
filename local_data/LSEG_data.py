@@ -188,14 +188,9 @@ def _get_batch_data_lseg_RICs(instruments: list, batch: int = 1000) -> pd.DataFr
     """
     Fetch LSEG RICs for a list of ISINs in batches and return one valid RIC per ISIN.
 
-    For each ISIN, rows with missing RICs are discarded, and the first non-null
-    RIC encountered is retained. If multiple valid RICs exist for an ISIN, the
-    selection is based on the original ordering of the data returned by LSEG
-
-
     Parameters
     ----------
-    isins : list
+    instruments : list
         List of ISIN strings to query.
     batch : int, optional
         Number of ISINs per request batch (default is 1000).
@@ -203,12 +198,11 @@ def _get_batch_data_lseg_RICs(instruments: list, batch: int = 1000) -> pd.DataFr
     Returns
     -------
     pd.DataFrame
-        DataFrame containing one row per ISIN with a non-null RIC with columns:
+        DataFrame containing one row per ISIN:
 
-        - Instrument
         - ISIN
-        - LsegName
-        - PrimaryIssueRIC
+        - RIC
+        - Company Common Name
     """
     results = []
     for i in range(0, len(instruments), batch):
@@ -223,23 +217,11 @@ def _get_batch_data_lseg_RICs(instruments: list, batch: int = 1000) -> pd.DataFr
 
     df = pd.concat(results, ignore_index=True)
     df.drop_duplicates(inplace=True)
+    df.rename(columns={'Instrument': 'ISIN'}, inplace=True)
     
-    # df.rename(columns={'Company Common Name': 'LsegCompanyName'}, inplace=True)
-    # df['PrimaryIssueRIC'] = df['Primary Issue RIC'].str.strip().replace('', pd.NA)
-    # df.drop(columns=['Primary Issue RIC'], inplace=True)
+    return df
 
-    # mark which ISINs have at least one valid RIC
-    valid_inst = df.loc[df['PrimaryIssueRIC'].notna(), 'Instrument'].unique()
-
-    # keep rows where:
-    # - RIC is not null OR
-    # - ISIN has no valid RIC at all
-    filtered_df = df[
-        (df['PrimaryIssueRIC'].notna()) | (~df['Instrument'].isin(valid_inst))
-    ]
-    return filtered_df[~filtered_df['PrimaryIssueRIC'].isna()]
-
-def update_isin_ric_mapping(out_file: str, indecies: list = ['0#.RUA', '0#.STOXX']):
+def update_isin_ric_mapping(out_file: str, indices: list = ['0#.RUA', '0#.STOXX']):
     """
     Fetch LSEG RICs for a list of ISINs and save the mapping to a CSV.
 
@@ -255,16 +237,79 @@ def update_isin_ric_mapping(out_file: str, indecies: list = ['0#.RUA', '0#.STOXX
     instruments = pd.read_csv(os.path.join(DATA_DIR, 'bloomberg_index_constituents.csv'))['ISIN'].unique().tolist()
 
     logger.info('Fetching LSEG RUA, STOXX constituents...')
-    current_rics = get_data(indecies, fields=["TR.ISIN", "TR.CommonName"])
+    current_rics = get_data(indices, fields=["TR.ISIN", "TR.CommonName"])
 
     ric_lseg = current_rics[current_rics.ISIN.isin(instruments)].drop_duplicates('Instrument').sort_values('Instrument').reset_index(drop=True)
     ric_lseg.rename(columns={'Instrument': 'RIC'}, inplace=True)
 
-    instruments_not_found = set(instruments) - set(ric_lseg)
+    logger.info('Fetching missing constituents by instrument...')
+    instruments_not_found = list(set(instruments) - set(ric_lseg['ISIN']))
+    rics_remaining = _get_batch_data_lseg_RICs(instruments_not_found)
 
-    ric_lseg.to_csv(os.path.join(DATA_DIR, out_file), index=False)
-    logger.info(f"Saved ISIN -> RIC mapping: {len(ric_lseg)} rows to {out_file}")
+    isin_ric_mapping = pd.concat([ric_lseg, rics_remaining[~rics_remaining['ISIN'].isin(ric_lseg['ISIN'])]])
 
+    isin_ric_mapping.drop_duplicates('RIC', keep='first', inplace=True)
+    isin_ric_mapping.drop_duplicates('ISIN', keep='first', inplace=True)
+    isin_ric_mapping.rename(columns={'Company Common Name': 'LsegCompanyName'}, inplace=True)
+    isin_ric_mapping.to_csv(os.path.join(DATA_DIR, out_file), index=False)
+    logger.info(f"Saved ISIN -> RIC mapping: {len(isin_ric_mapping)} rows to {out_file}")
+
+
+# ---------- Fix ISIN-RIC mapping ----------
+
+SUFFIX_MAP = {'.O': '.OQ', '.L': '.L', '.PA': '.PA', '.K': '.N'}
+
+def _fix_ric(ric: str) -> str:
+    """Convert LSEG Primary RIC suffix to standard RIC suffix."""
+    for old, new in SUFFIX_MAP.items():
+        if ric.endswith(old):
+            return ric[:ric.rfind('.')] + new
+    return ric + '.N'
+
+def _build_isin_to_ric_mapping() -> dict:
+    """Build a complete ISIN -> RIC mapping, filling gaps via LSEG lookup."""
+    map_rics = pd.read_csv(os.path.join(DATA_DIR, 'isin_ric_mapping.csv'))[['ISIN', 'RIC']]
+    known = map_rics.set_index('ISIN')['RIC'].to_dict()
+
+    # Find ISINs in price folders not covered by the existing mapping
+    folder_isins = [f.split("RIC=")[1] for f in os.listdir(PRICE_DATA_OUTPUT_DIR) if f.startswith("RIC=")]
+    missing = [isin for isin in folder_isins if isin not in known and len(isin)==12]
+
+    if missing:
+        looked_up = (
+            get_data(missing, fields="TR.PrimaryRIC")
+            .rename(columns={'Instrument': 'ISIN', 'Primary Issue RIC': 'RIC'})
+            .dropna(subset=['RIC'])
+            .loc[lambda df: df['RIC'] != '']
+        )
+        looked_up['RIC'] = looked_up['RIC'].apply(_fix_ric)
+        known.update(looked_up.set_index('ISIN')['RIC'].to_dict())
+
+    return known
+
+def rename_folders(dry_run: bool = True):
+    """Rename ISIN folders to RIC folders in PRICE_DATA_OUTPUT_DIR."""
+    my_mapping = _build_isin_to_ric_mapping()
+    missing = []
+    for folder in os.listdir(PRICE_DATA_OUTPUT_DIR):
+        if not folder.startswith("RIC=") or len(folder.split("RIC=")[1])!=12 or '.' in folder.split("RIC=")[1]:
+            continue
+        isin = folder.split("RIC=")[1]
+        if isin not in my_mapping:
+            missing.append(isin)
+            print(f"No mapping for {isin}, skipping")
+            continue
+        old_path = os.path.join(PRICE_DATA_OUTPUT_DIR, folder)
+        new_path = os.path.join(PRICE_DATA_OUTPUT_DIR, f"RIC={my_mapping[isin]}")
+        if dry_run:
+            print(f"[dry run] {old_path} -> {new_path}")
+        elif os.path.exists(new_path):
+            print(f"Skipping {isin}, {my_mapping[isin]} already exists")
+            continue
+        else:
+            os.rename(old_path, new_path)
+            print(f"Renamed {old_path} -> {new_path}")
+    
 
 # ---------- Upsert Raw Price/Volume Data For All Constituents to Parquet Locally ---------- #
 
@@ -367,9 +412,27 @@ def download_all(rics, start_date, end_date, skip_existing=False, upsert=False, 
 
 # ---------- Load Local LSEG Data for Backtesting ---------- #
 
-def get_timeseries(data: pd.DataFrame, constituents: pd.DataFrame, value_col: str = 'Close', index: str = '.RUA'):
+def get_historical_index_constituents():
+    """Fetch RIC, Year, ISIN, ... for the historical index constituents sourced from Bloomberg"""
+    isin_ric_mapping = pd.read_csv(os.path.join(DATA_DIR, 'isin_ric_mapping.csv'))
+    bb_index_constituents = pd.read_csv(os.path.join(DATA_DIR, 'bloomberg_index_constituents.csv'))
+    merged = bb_index_constituents.join(isin_ric_mapping.set_index('ISIN'), on='ISIN', how='left')
+    return merged
+
+def get_current_index_constituents():
+    """Fetch RIC's for the currently listed stocks of Russell3000 and STOXX600 from LSEG"""
+    stoxx = get_data(['0#.STOXX'])
+    rua = get_data(['0#.RUA'])
+    stoxx_df = stoxx.drop_duplicates(subset=['Instrument']).reset_index(drop=True).rename(columns={'Instrument': 'RIC'})
+    rua_df = rua.drop_duplicates(subset=['Instrument']).reset_index(drop=True).rename(columns={'Instrument': 'RIC'})
+
+    return pd.concat([stoxx_df, rua_df], axis=0).reset_index(drop=True)
+
+def get_timeseries(data: pd.DataFrame, value_col: str = 'Close', index: str = '.RUA'):
     """All data for stocks while they were listed in the index, plus the index itself."""
-    constituents.rename(columns={'ISIN': 'RIC'}, inplace=True)
+    isin_ric_mapping = pd.read_csv(os.path.join(DATA_DIR, 'isin_ric_mapping.csv'))
+    bb_index_constituents = pd.read_csv(os.path.join(DATA_DIR, 'bloomberg_index_constituents.csv'))
+    constituents = bb_index_constituents.join(isin_ric_mapping.set_index('ISIN'), on='ISIN', how='left')
 
     years = data['Date'].dt.year.values
     rics = data['RIC'].values 
@@ -419,24 +482,48 @@ if __name__ == '__main__':
         format='%(asctime)s | %(levelname)s | %(message)s'
     )
 
-    if True:
-        update_isin_ric_mapping(out_file='isin_ric_mapping.csv')
+    # Daily update: Upsert daily price/volume data
 
-    if False:
-        # Daily update: Upsert daily price/volume data
-        traded_instruments = pd.read_csv('data/instrument_ric_mapping.csv')['Instrument'].dropna().unique().tolist()
-        all_instruments = traded_instruments + ['.RUA', '.STOXX', '.STOXX50E']
-        last_date_of_data = pd.read_parquet(f"data/lseg/RIC=.STOXX50E").dropna(subset=['Close']).iloc[-1].Date
+    
+    def get_price_data_for_rics_in_mapping_file():
+        stoxx = get_data(['0#.STOXX'])
+        rua = get_data(['0#.RUA'])
 
+        stoxx['Instrument'].drop_duplicates().reset_index(drop=True)
+        rua['Instrument'].drop_duplicates().reset_index(drop=True)
+
+        data_rics = [entry.name.split("RIC=")[1] for entry in os.scandir(PRICE_DATA_OUTPUT_DIR) if entry.is_dir()]
+
+        isin_ric_mapping = pd.read_csv(os.path.join(DATA_DIR, 'isin_ric_mapping.csv'))
+        mapping_rics_not_downloaded = isin_ric_mapping[~isin_ric_mapping['RIC'].isin(data_rics)]['RIC'].dropna().unique().tolist()
+        
         download_all(
-            rics=all_instruments, 
-            start_date=last_date_of_data.strftime('%Y-%m-%d'), 
+            rics=mapping_rics_not_downloaded,#all_instruments,
+            start_date='2000-01-01',#last_date_of_data.strftime('%Y-%m-%d'), 
             end_date=date.today().strftime('%Y-%m-%d'), 
             upsert=True, 
-            chunk_size=200, 
-            skip_existing=False, 
-            print_ric=False
+            chunk_size=1, 
+            skip_existing=True, 
+            print_ric=True
         )
 
+    def daily_update():
+        isin_ric_mapping = pd.read_csv(os.path.join(DATA_DIR, 'isin_ric_mapping.csv'))['RIC'].dropna().unique().tolist()
+        existing_rics = [f.split("RIC=")[1] for f in os.listdir(PRICE_DATA_OUTPUT_DIR) if "RIC=" in f]
+        
+        traded_instruments = sorted(list(set(isin_ric_mapping).union(set(existing_rics))))
 
+        all_instruments = traded_instruments + ['.RUA', '.STOXX', '.STOXX50E']
 
+        # last_date_of_data = pd.read_parquet(f"data/lseg/RIC=.STOXX50E").dropna(subset=['Close']).iloc[-1].Date
+        download_all(
+            rics=all_instruments,
+            start_date='2026-03-29',#last_date_of_data.strftime('%Y-%m-%d'), 
+            end_date=date.today().strftime('%Y-%m-%d'), 
+            upsert=True,
+            chunk_size=200, 
+            skip_existing=False, 
+            print_ric=True
+        )
+
+    daily_update()
