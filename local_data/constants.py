@@ -1,6 +1,5 @@
 from typing import Literal, TypedDict
 
-# LSEG_data.py constants
 BB_HISTORICAL = 'historical_bb'
 LSEG_ACTIVE = 'active_lseg'
 DATA = 'data'
@@ -47,10 +46,3 @@ FUNDAMENTAL_METRICS_QUARTERLY = [
     "TR.F.LTDebtPctofTotEq(Period=FQ0)",     # Long-term debt % of total equity
     "TR.F.EarnRetentionRate(Period=FQ0)",    # Earnings Retention Rate
 ]
-
-# QRT_utils.py constants
-GROUP_ID = 'ICL05'
-USER = 'q8576'
-type Regions = Literal['AMER', 'EMEA']
-type Markets = Literal['.SPX', '.STOXX50E']
-type Instruments = Literal['RIC', 'ISIN']
