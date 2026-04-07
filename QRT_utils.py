@@ -4,10 +4,10 @@ import numpy as np
 import pandas as pd
 from glob import glob
 import yfinance as yf
+from constants import *
 import matplotlib.pyplot as plt
 from functools import lru_cache
 from local_data.LSEG_data import *
-from local_data.constants import *
 from clients.qsec_client.sample_code import *
 
 logger = logging.getLogger(__name__)
