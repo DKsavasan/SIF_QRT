@@ -6,30 +6,30 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import lseg.data as ld
-from datetime import date
+from .constants import *
+from typing import Literal
 import pyarrow.parquet as pq
+from datetime import date, datetime
 
 
 pd.set_option('future.no_silent_downcasting', True)
 logger = logging.getLogger(__name__)
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(_SCRIPT_DIR, 'data')
-PRICE_DATA_OUTPUT_DIR = os.path.join(_SCRIPT_DIR, 'data', 'lseg')
-INDEX_NAME_MAPPING = {'RAY': '.SPX', 'SXXP': '.STOXX50E'}
-BB_COLUMN_RENAME = {'ISIN\n': 'ISIN', 'Sec Type\n': 'SecType'}
-DAILY_DATA_FIELDS = ["TR.PriceClose", "TR.Volume"]
+DATA_DIR = os.path.join(_SCRIPT_DIR, DATA)
+PRICE_DATA_OUTPUT_DIR = os.path.join(DATA_DIR, PRICE_VOLUME)
+FUNDAMENTALS_OUTPUT_DIR = os.path.join(DATA_DIR, FUNDAMENTALS)
 
 
 # ---------- LSEG SDK Functions ---------- #
 
-def get_data(instruments: list, fields: list = ["TR.PrimaryRIC", "TR.ISIN", "TR.CommonName"]):
+def get_data(instruments: list, fields: list = ["TR.PrimaryRIC", "TR.ISIN", "TR.CommonName"], date: str = None):
     ld.open_session()
     try:
         return ld.get_data(
-            universe=instruments,  # RIC'S or ISIN's: ['0#.STOXX', '0#.SPX']
+            universe=instruments,  # RIC'S or ISIN's, ex: ['0#.STOXX', '0#.RUA']
             fields=fields,
-            parameters={"SDate": '2002-01-31'}
+            parameters={"SDate": '2000-01-01' if date is None else date}
         )
     finally:
         ld.close_session()
@@ -52,7 +52,7 @@ def discovery_search(select="RIC,ISIN,TickerSymbol,DTSubjectName,IsPrimaryRIC", 
     try:
         base_filter = (
             "SearchAllCategoryv2 eq 'Equities' "
-            # " and MktCapCompanyUsd gt 0"
+            " and MktCapCompanyUsd gt 0"
         )
 
         full_filter = f"{filter_on} and {base_filter}" if filter_on else base_filter
@@ -61,13 +61,13 @@ def discovery_search(select="RIC,ISIN,TickerSymbol,DTSubjectName,IsPrimaryRIC", 
             view=ld.discovery.Views.EQUITY_QUOTES,
             top=10_000,
             filter=full_filter,
-            select=select # "ISIN,RIC,ListingStatus,RetireDate,TickerSymbol,DTSubjectName,RCSTRBC2012Leaf,RCSCurrencyLeaf,RCSExchangeCountryLeaf,MktCapCompanyUsd,ExchangeName,ExchangeCode,PermID,IsPrimaryRIC,AvgVol90D"
+            select=select
         )
     finally:
         ld.close_session()
 
 
-# ---------- Save Tradeable Index Constituents Localy ---------- #
+# ---------- Save Index Constituents: Historical and Tradeable ---------- #
 
 def _parse_bloomberg_export(folder: str) -> pd.DataFrame:
     """
@@ -130,7 +130,7 @@ def _parse_bloomberg_export(folder: str) -> pd.DataFrame:
             logger.warning(f"Failed to read {filename}: {e}")
             continue
 
-        df.rename(columns=BB_COLUMN_RENAME, inplace=True)
+        df.columns = df.columns.str.strip()
         df['Year'] = int(year_match.group())
         df.insert(0, 'Index', filename.split('_')[0])
         historical_constituents.append(df)
@@ -145,171 +145,139 @@ def _parse_bloomberg_export(folder: str) -> pd.DataFrame:
     df.dropna(subset=['ISIN'], inplace=True)
     return df.sort_values(['Year', 'ISIN'], ascending=[False, True])
 
-def save_bloomberg_index_constituents(
-    data_folders: list,
-    out_file: str
-):
+def _has_historical_data(instruments: list, batch: int = 5000) -> list:
     """
-    Build a consolidated index constituents dataset by merging Bloomberg exports
-    with LSEG RIC mappings, and save the result to a CSV file.
-
-    For each specified folder, the function:
-    - Parses Bloomberg constituent files into a standardized DataFrame.
-    - Extracts unique ISINs and retrieves corresponding RICs from LSEG in batches.
-    - Merges Bloomberg data with RIC mappings on ISIN.
-    - Appends results across all folders into a single dataset.
+    Filter a list of RICs or ISINs and return only those with historical price data on LSEG.
 
     Parameters
     ----------
-    data_folders : list, optional
-        List of subfolder names (under DATA_DIR) containing Bloomberg export files.
-        Each folder is processed independently and then combined. Default is ['Russell_3000'].
-    out_file : str, optional
-        Name of the output CSV file saved in DATA_DIR. Default is 'index_constituents.csv'.
+    instruments : list
+        List of RICs or ISINs to check.
     batch : int, optional
-        Batch size for LSEG ISIN queries. Default is 1000.
+        Number of instruments per API request batch (default 5000).
+
+    Returns
+    -------
+    list
+        Subset of input instruments that have at least one historical price point.
+    """
+    logger.info("Searching for instruments with historical data...")
+    instruments_with_data = []
+    for i in range(0, len(instruments), batch):
+        try:
+            inst_batch = instruments[i:i + batch]
+            inst_w_data_batch = get_history(
+                # last data point is always retrieved, thats why this works, even for delisted RIC's
+                inst_batch, fields = ["TR.PriceClose"], start=datetime.now().strftime('%Y-%m-%d')
+            ).dropna(axis=1, how='all').columns.to_list()
+            logger.info(f"Found {len(inst_w_data_batch)} RIC's with data in batch")
+            instruments_with_data += inst_w_data_batch
+        except Exception as e:
+            logger.warning(f"get_history batch failed: {e}")
+
+    return list(set(instruments_with_data))
+
+def save_bloomberg_historical_constituents(print_only: bool = False) -> None:
+    """
+    Consolidate historical Bloomberg index constituents with LSEG RIC mappings and save to CSV.
+
+    This function:
+    - Reads Bloomberg constituent files from multiple folders.
+    - Standardizes the data into a single DataFrame.
+    - Retrieves RICs for each unique ISIN and checks which have historical price data on LSEG.
+    - Adds a boolean column 'HasLsegData' indicating availability of historical data.
+    - Optionally prints the resulting DataFrame and summary statistics.
+    - Otherwise, saves the dataset to disk as CSV.
+
+    Parameters
+    ----------
+    print_only : bool
+        Print the table instead of writing it to the file.
 
     Returns
     -------
     None
         Writes the combined dataset to disk as a CSV file.
     """
+    logger.info("Parsing bloomberg constituents excel files...")
     all_constituents = []
-    for folder in data_folders:
+    for folder in BB_INDEX_CONSTITUENT_FOLDERS:
         folder_path = os.path.join(DATA_DIR, folder)
         constituents_bb = _parse_bloomberg_export(folder=folder_path)
         all_constituents.append(constituents_bb)
 
-    combined = pd.concat(all_constituents, ignore_index=True)
-    combined.to_csv(os.path.join(DATA_DIR, out_file), index=False)
-    logger.info(f"Saved bloomberg constituents: {len(combined)} rows to {out_file}")
+    bb_constituents = pd.concat(all_constituents, ignore_index=True)[['Index', 'Name', 'ISIN', 'Year']]
 
-def _get_batch_data_lseg_RICs(instruments: list, batch: int = 1000) -> pd.DataFrame:
+    # Get unique isin's, filter on 'bb_constituents' with lseg data, assign new col for HasLsegData (bool)
+    bb_isins = bb_constituents.ISIN.unique().tolist()
+    logger.info(f"Found {len(bb_isins)} bloomberg constituents")
+    bb_isins_with_data = _has_historical_data(instruments=bb_isins)
+    bb_constituents['HasLsegData'] = bb_constituents.ISIN.isin(bb_isins_with_data)
+
+    if print_only:
+        print(bb_constituents)
+        print(bb_constituents.groupby(['Index', 'Year']).nunique())
+        print(f"Prepared {len(bb_constituents)} rows, and {len(bb_isins_with_data)} unique bloomberg constituents with data")
+    else:
+        bb_constituents.to_csv(os.path.join(DATA_DIR, BB_HISTORICAL_CONSTITUENTS_FILE), index=False)
+        logger.info(f"Saved {len(bb_constituents)} rows, and {len(bb_isins_with_data)} unique bloomberg constituents with data to {BB_HISTORICAL_CONSTITUENTS_FILE}")
+
+def save_lseg_active_constituents(print_only: bool = False) -> None:
     """
-    Fetch LSEG RICs for a list of ISINs in batches and return one valid RIC per ISIN.
+    Fetch and save all active LSEG RUA/STOXX constituents with RICs and ISINs.
+
+    For each universe (US/EU), retrieves active constituents, drops duplicate RICs, 
+    checks which have historical price data, and either prints the table or saves it to CSV.
 
     Parameters
     ----------
-    instruments : list
-        List of ISIN strings to query.
-    batch : int, optional
-        Number of ISINs per request batch (default is 1000).
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame containing one row per ISIN:
-
-        - ISIN
-        - RIC
-        - Company Common Name
+    print_only : bool
+        If True, prints the DataFrame instead of saving to file.
     """
-    results = []
-    for i in range(0, len(instruments), batch):
-        try:
-            firms = get_data(instruments[i:i + batch], fields=["TR.CommonName", "TR.RIC"])
-            results.append(firms)
-        except Exception as e:
-            logger.warning(f"get_data batch failed: {e}")
+    logger.info("Fetching lseg active constituents...")
+    # Fetch all active RUA/STOXX constituents from lseg
+    active_rua = get_data([US_UNIVERSE], fields=["TR.ISIN", "TR.CommonName"]).assign(Index=US_INDEX_BENCHMARK)
+    active_stoxx = get_data([EU_UNIVERSE], fields=["TR.ISIN", "TR.CommonName"]).assign(Index=EU_INDEX_BENCHMARK)
+    lseg_active_rics = pd.concat(
+        [active_rua, active_stoxx]
+    ).rename(columns={'Company Common Name': 'Name', 'Instrument': 'RIC'})[['Index', 'RIC', 'ISIN', 'Name']]
+    lseg_active_rics = lseg_active_rics.drop_duplicates(subset='RIC', keep='first').reset_index(drop=True)
 
-    if not results:
-        raise RuntimeError("All LSEG batches failed")
+    active_rics_with_data = _has_historical_data(instruments=lseg_active_rics.RIC.unique().tolist())
+    lseg_active_rics['HasLsegData'] = lseg_active_rics.RIC.isin(active_rics_with_data)
 
-    df = pd.concat(results, ignore_index=True)
-    df.drop_duplicates(inplace=True)
-    df.rename(columns={'Instrument': 'ISIN'}, inplace=True)
-    
-    return df
+    if print_only:
+        print(lseg_active_rics)
+        print(lseg_active_rics.groupby('Index').nunique())
+        print(f"Prepared {len(lseg_active_rics)} rows containing {len(active_rics_with_data)} RIC's with data")
+    else:
+        lseg_active_rics.to_csv(os.path.join(DATA_DIR, LSEG_ACTIVE_CONSTITUENTS_FILE), index=False)
+        logger.info(f"Saved {len(lseg_active_rics)} rows containing {len(active_rics_with_data)} RIC's with data to {LSEG_ACTIVE_CONSTITUENTS_FILE}")
 
-def update_isin_ric_mapping(out_file: str, indices: list = ['0#.SPX', '0#.STOXX']):
+def get_bloomberg_historical_constituents(has_data: bool = True) -> pd.DataFrame:
     """
-    Fetch LSEG RICs for a list of ISINs and save the mapping to a CSV.
-
-    Parameters
-    ----------
-    out_file : str
-        Name of the output CSV file saved in DATA_DIR.
-
-    Returns
-    -------
-    None
+    Returns a DataFrame with the following columns:
+    - Index        : str, benchmark index
+    - Name         : str, company common name
+    - ISIN         : str, ISIN identifier
+    - Year         : int, year of the constituent in the index
+    - HasLsegData  : bool, whether the instrument has historical price data
     """
-    instruments = pd.read_csv(os.path.join(DATA_DIR, 'bloomberg_index_constituents.csv'))['ISIN'].unique().tolist()
+    df = pd.read_csv(os.path.join(DATA_DIR, BB_HISTORICAL_CONSTITUENTS_FILE))
+    return df[df.HasLsegData==has_data]
 
-    logger.info('Fetching LSEG RUA, STOXX constituents...')
-    current_rics = get_data(indices, fields=["TR.ISIN", "TR.CommonName"])
+def get_lseg_active_constituents(has_data: bool = True) -> pd.DataFrame:
+    """
+    Returns a DataFrame with the following columns:
+    - Index : str, benchmark index
+    - RIC   : str, LSEG RIC
+    - ISIN  : str, ISIN identifier
+    - Name  : str, company common name
+    - HasLsegData : bool, whether the instrument has historical price data
+    """
+    df = pd.read_csv(os.path.join(DATA_DIR, LSEG_ACTIVE_CONSTITUENTS_FILE))
+    return df[df.HasLsegData==has_data]
 
-    ric_lseg = current_rics[current_rics.ISIN.isin(instruments)].drop_duplicates('Instrument').sort_values('Instrument').reset_index(drop=True)
-    ric_lseg.rename(columns={'Instrument': 'RIC'}, inplace=True)
-
-    logger.info('Fetching missing constituents by instrument...')
-    instruments_not_found = list(set(instruments) - set(ric_lseg['ISIN']))
-    rics_remaining = _get_batch_data_lseg_RICs(instruments_not_found)
-
-    isin_ric_mapping = pd.concat([ric_lseg, rics_remaining[~rics_remaining['ISIN'].isin(ric_lseg['ISIN'])]])
-
-    isin_ric_mapping.drop_duplicates('RIC', keep='first', inplace=True)
-    isin_ric_mapping.drop_duplicates('ISIN', keep='first', inplace=True)
-    isin_ric_mapping.rename(columns={'Company Common Name': 'LsegCompanyName'}, inplace=True)
-    isin_ric_mapping.to_csv(os.path.join(DATA_DIR, out_file), index=False)
-    logger.info(f"Saved ISIN -> RIC mapping: {len(isin_ric_mapping)} rows to {out_file}")
-
-
-# ---------- Fix ISIN-RIC mapping ----------
-
-SUFFIX_MAP = {'.O': '.OQ', '.L': '.L', '.PA': '.PA', '.K': '.N'}
-
-def _fix_ric(ric: str) -> str:
-    """Convert LSEG Primary RIC suffix to standard RIC suffix."""
-    for old, new in SUFFIX_MAP.items():
-        if ric.endswith(old):
-            return ric[:ric.rfind('.')] + new
-    return ric + '.N'
-
-def _build_isin_to_ric_mapping() -> dict:
-    """Build a complete ISIN -> RIC mapping, filling gaps via LSEG lookup."""
-    map_rics = pd.read_csv(os.path.join(DATA_DIR, 'isin_ric_mapping.csv'))[['ISIN', 'RIC']]
-    known = map_rics.set_index('ISIN')['RIC'].to_dict()
-
-    # Find ISINs in price folders not covered by the existing mapping
-    folder_isins = [f.split("RIC=")[1] for f in os.listdir(PRICE_DATA_OUTPUT_DIR) if f.startswith("RIC=")]
-    missing = [isin for isin in folder_isins if isin not in known and len(isin)==12]
-
-    if missing:
-        looked_up = (
-            get_data(missing, fields="TR.PrimaryRIC")
-            .rename(columns={'Instrument': 'ISIN', 'Primary Issue RIC': 'RIC'})
-            .dropna(subset=['RIC'])
-            .loc[lambda df: df['RIC'] != '']
-        )
-        looked_up['RIC'] = looked_up['RIC'].apply(_fix_ric)
-        known.update(looked_up.set_index('ISIN')['RIC'].to_dict())
-
-    return known
-
-def rename_folders(dry_run: bool = True):
-    """Rename ISIN folders to RIC folders in PRICE_DATA_OUTPUT_DIR."""
-    my_mapping = _build_isin_to_ric_mapping()
-    missing = []
-    for folder in os.listdir(PRICE_DATA_OUTPUT_DIR):
-        if not folder.startswith("RIC=") or len(folder.split("RIC=")[1])!=12 or '.' in folder.split("RIC=")[1]:
-            continue
-        isin = folder.split("RIC=")[1]
-        if isin not in my_mapping:
-            missing.append(isin)
-            print(f"No mapping for {isin}, skipping")
-            continue
-        old_path = os.path.join(PRICE_DATA_OUTPUT_DIR, folder)
-        new_path = os.path.join(PRICE_DATA_OUTPUT_DIR, f"RIC={my_mapping[isin]}")
-        if dry_run:
-            print(f"[dry run] {old_path} -> {new_path}")
-        elif os.path.exists(new_path):
-            print(f"Skipping {isin}, {my_mapping[isin]} already exists")
-            continue
-        else:
-            os.rename(old_path, new_path)
-            print(f"Renamed {old_path} -> {new_path}")
-    
 
 # ---------- Upsert Raw Price/Volume Data For All Constituents to Parquet Locally ---------- #
 
@@ -337,14 +305,18 @@ def _fetch_chunk_with_retry(chunk, start_date, end_date, max_retry: int = 1, ret
                 logger.warning(f"Skipping {chunk} after {max_retry} failed attempts", exc_info=e)
                 return pd.DataFrame()
 
-def _write_parquet_incremental(df, ric, upsert=False) -> None:
-    """Append or create parquet file for a single RIC."""
-    folder = os.path.join(PRICE_DATA_OUTPUT_DIR, f"RIC={ric}")
+def _write_parquet_incremental(df, inst, sub_folder, inst_name='RIC', upsert=False) -> None:
+    """Append or create parquet file for a single instrument."""
+    folder = os.path.join(PRICE_DATA_OUTPUT_DIR, sub_folder, f"{inst_name}={inst}")
     os.makedirs(folder, exist_ok=True)
     file_path = os.path.join(folder, f"part.parquet")
 
     # Keep only Date, Close, Volume
     df = df[['Date', 'Close', 'Volume']]
+    if df.empty:
+        logger.warning(f"Empty data for {inst}: {e}")
+        return
+
     if upsert and os.path.exists(file_path):
         try:
             existing = pq.read_table(file_path).to_pandas()
@@ -363,115 +335,277 @@ def _write_parquet_incremental(df, ric, upsert=False) -> None:
     table = pa.Table.from_pandas(df, preserve_index=False)
     pq.write_table(table, file_path)
 
-def download_all(rics, start_date, end_date, skip_existing=False, upsert=False, chunk_size=1, print_ric=True) -> None:
+def download_all_prices(instruments, sub_folder, start_date, end_date, inst_name='RIC', skip_existing=False, upsert=False, chunk_size=1, print_inst=False, sample_size=None) -> None:
     ld.open_session()
     c = 0
     try:
-        for chunk in _chunk_list(rics, chunk_size):
+        for chunk in _chunk_list(instruments, chunk_size):
             if skip_existing:
-                folder = os.path.join(PRICE_DATA_OUTPUT_DIR, f"RIC={chunk[0]}")
+                folder = os.path.join(PRICE_DATA_OUTPUT_DIR, sub_folder, f"{inst_name}={chunk[0]}")
                 file_path = os.path.join(folder, "part.parquet")
 
                 if os.path.exists(file_path):
-                    logger.warning("Skipped: ", chunk[0])
+                    logger.info(f"Skipped existing: {chunk[0]}")
                     continue
 
             df = _fetch_chunk_with_retry(chunk=chunk, start_date=start_date, end_date=end_date)
             if df.empty:
+                logger.warning(f"Empty data: {chunk}")
                 continue
             
             if len(chunk) > 1:
                 # stack multi-RIC panel
                 df = df.stack(level=0, future_stack=True).reset_index()
-                df.rename(columns={'level_1': 'RIC'}, inplace=True)
+                df.rename(columns={'level_1': inst_name}, inplace=True)
             else:
-                df['RIC'] = chunk[0]
+                df[inst_name] = chunk[0]
                 df.reset_index(inplace=True)
                 df.columns.name = None
             
             df.rename(columns={'Price Close': 'Close'}, inplace=True)
-            df.sort_values(['RIC','Date'], inplace=True)
+            df.sort_values([inst_name, 'Date'], inplace=True)
             df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
             df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
+            df['Date'] = pd.to_datetime(df['Date'])
+            df.dropna(subset=['Date'], inplace=True)
             df.dropna(subset=['Close', 'Volume'], how='all', inplace=True)
             df.reset_index(drop=True, inplace=True)
 
-            # write each RIC incrementally
-            for ric in df['RIC'].unique():
+            # write each instrument incrementally
+            for inst in df[inst_name].unique():
                 c+=1
                 if c % 1000 == 0:
                     logger.info(f"Downloaded data for {c} stocks")
-                if print_ric:
-                    logger.info(ric) 
-                ric_df = df[df['RIC'] == ric].copy()
-                _write_parquet_incremental(df=ric_df, ric=ric, upsert=upsert)
+                if print_inst:
+                    logger.info(inst) 
+                if c==sample_size:
+                    logger.info(f"Downloaded all data for sample size {c} stocks")
+                    return
+                inst_df = df[df[inst_name] == inst].copy()
+
+                _write_parquet_incremental(
+                    df=inst_df, inst=inst, sub_folder=sub_folder, inst_name=inst_name, upsert=upsert
+                )
 
     finally:
         ld.close_session()
 
+def save_fundamental_data(instruments: list, sub_folder: str, start_date: str = '2000-01-01', inst_name: str = 'RIC', batch: int = 10, sample_size: int = None, skip_existing=False):
+    """
+    Rewrites all fundamentals data for the specified instruments.
+    """
+    logger.info(f"Fetching fundamental data for {len(instruments)} {inst_name}'s...")
+    existing_insts = set()
+    for f in os.listdir(os.path.join(FUNDAMENTALS_OUTPUT_DIR, sub_folder)):
+        assert f.startswith(f"{inst_name}="), f"Unexpected file in folder: {f}"
+        existing_insts.add(f.split(f"{inst_name}=")[1])
 
-# ---------- Load Local LSEG Data for Backtesting ---------- #
+    c=0
+    for instrument_chunk in _chunk_list(instruments, batch):
+        instrument_chunk = [inst for inst in instrument_chunk if inst not in existing_insts]
+        if not instrument_chunk and skip_existing:
+            continue
 
-def get_historical_index_constituents():
-    """Fetch RIC, Year, ISIN, ... for the historical index constituents sourced from Bloomberg"""
-    isin_ric_mapping = pd.read_csv(os.path.join(DATA_DIR, 'isin_ric_mapping.csv'))
-    bb_index_constituents = pd.read_csv(os.path.join(DATA_DIR, 'bloomberg_index_constituents.csv'))
-    merged = bb_index_constituents.join(isin_ric_mapping.set_index('ISIN'), on='ISIN', how='left')
-    return merged
+        df = get_history(instrument_chunk, fields=FUNDAMENTAL_METRICS_QUARTERLY, start=start_date)
 
-def get_current_index_constituents():
-    """Fetch RIC's for the currently listed stocks of Russell3000 and STOXX600 from LSEG"""
-    stoxx = get_data(['0#.STOXX'])
-    rua = get_data(['0#.SPX'])
-    stoxx_df = stoxx.drop_duplicates(subset=['Instrument']).reset_index(drop=True).rename(columns={'Instrument': 'RIC'})
-    rua_df = rua.drop_duplicates(subset=['Instrument']).reset_index(drop=True).rename(columns={'Instrument': 'RIC'})
+        instrument_cols = df.columns.levels[0] if isinstance(df.columns, pd.MultiIndex) else instrument_chunk
+        df = df.apply(pd.to_numeric, errors='coerce')
 
-    return pd.concat([stoxx_df, rua_df], axis=0).reset_index(drop=True)
+        for inst in instrument_cols:
+            inst_df = df[inst] if isinstance(df.columns, pd.MultiIndex) else df
+            inst_df.index = inst_df.index.date
+            inst_df = inst_df.groupby(inst_df.index).last()
+            inst_df = inst_df.dropna(how='all')
+            inst_df.sort_index(inplace=True)
 
-def get_timeseries(data: pd.DataFrame, value_col: str = 'Close', index: str = '.SPX'):
-    """All data for stocks while they were listed in the index, plus the index itself."""
-    isin_ric_mapping = pd.read_csv(os.path.join(DATA_DIR, 'isin_ric_mapping.csv'))
-    bb_index_constituents = pd.read_csv(os.path.join(DATA_DIR, 'bloomberg_index_constituents.csv'))
-    constituents = bb_index_constituents.join(isin_ric_mapping.set_index('ISIN'), on='ISIN', how='left')
+            folder = os.path.join(FUNDAMENTALS_OUTPUT_DIR, sub_folder, f"{inst_name}={inst}")
+            os.makedirs(folder, exist_ok=True)
+            file_path = os.path.join(folder, f"part.parquet")
 
-    years = data['Date'].dt.year.values
-    rics = data['RIC'].values 
+            table = pa.Table.from_pandas(inst_df)
+            pq.write_table(table, file_path)
+            c+=1
+            if c==sample_size:
+                logger.info(f"Downloaded fundamental data for sample size {c} stocks")
+                return
+            
+        if c%batch == 0:
+            logger.info(f"Downloaded fundamental data for {c} stocks. This chunk: {instrument_chunk}")
 
-    # All historical index constituents since 2000-01-01
-    constituents = constituents[constituents['Index']==index][['RIC', 'Year']].drop_duplicates()
-    constituents['RIC'] = constituents['RIC'].astype(data['RIC'].dtype)
 
-    valid_pairs = set(zip(constituents['RIC'], constituents['Year']))
+# ---------- Download All Data ----------
+
+def download_all_data(
+        active_price_data: bool=True,
+        historical_price_data: bool=True,
+        active_fundamentals: bool=False,
+        historical_fundamentals: bool=False,
+        fundamentals_batch: int=50,
+        start_date: str = '2000-01-01',
+        sample_size: int = None,
+        skip_existing=True,
+        update_lseg_active_constituents: bool=False,
+        update_bb_historical_constituents: bool=False
+    ) -> None:
+
+    if update_lseg_active_constituents:
+        save_lseg_active_constituents()
+
+    if update_bb_historical_constituents:
+        save_bloomberg_historical_constituents()
+
+    lseg_active_rics = sorted(get_lseg_active_constituents().RIC.unique().tolist())
+    if active_price_data:
+        download_all_prices(
+            instruments=lseg_active_rics + [EU_INDEX_BENCHMARK, US_INDEX_BENCHMARK],
+            sub_folder=LSEG_ACTIVE,
+            start_date=start_date,
+            end_date=datetime.now().strftime(Y_M_D),
+            inst_name='RIC',
+            skip_existing=skip_existing,
+            upsert=True,
+            chunk_size=1,
+            print_inst=True,
+            sample_size=sample_size
+        )
+
+    if active_fundamentals:
+        save_fundamental_data(
+            instruments=lseg_active_rics,
+            sub_folder=LSEG_ACTIVE,
+            start_date=start_date,
+            inst_name='RIC',
+            sample_size=sample_size,
+            batch=fundamentals_batch,
+            skip_existing=skip_existing
+        )
     
-    mask = np.fromiter(
-        ((ric, year) in valid_pairs for ric, year in zip(rics, years)),
-        dtype=bool,
-        count=len(data)
+    bb_historical_inst = sorted(get_bloomberg_historical_constituents().ISIN.unique().tolist())
+    if historical_price_data:
+        download_all_prices(
+            instruments=bb_historical_inst,
+            sub_folder=BB_HISTORICAL,
+            start_date=start_date,
+            end_date=datetime.now().strftime(Y_M_D),
+            inst_name='ISIN',
+            skip_existing=skip_existing,
+            upsert=True,
+            chunk_size=1,
+            print_inst=True,
+            sample_size=sample_size
+        )
+
+    if historical_fundamentals:
+        save_fundamental_data(
+            instruments=bb_historical_inst,
+            sub_folder=BB_HISTORICAL,
+            start_date=start_date,
+            inst_name='ISIN',
+            sample_size=sample_size,
+            batch=fundamentals_batch,
+            skip_existing=skip_existing
+        )
+
+def update_price_data(batch: int=5000):
+    """
+    Run this once you have data downloaded up to a recent date
+    """
+    lseg_active = get_lseg_active_constituents()
+
+    lseg_active_dir = os.path.join(PRICE_DATA_OUTPUT_DIR, LSEG_ACTIVE)
+    last_date_stoxx = pd.read_parquet(os.path.join(lseg_active_dir, f"RIC={EU_INDEX_BENCHMARK}")).dropna(subset=['Close']).iloc[-1].Date
+    last_date_spx = pd.read_parquet(os.path.join(lseg_active_dir, f"RIC={US_INDEX_BENCHMARK}")).dropna(subset=['Close']).iloc[-1].Date
+
+    download_all_prices(
+        instruments=lseg_active.RIC.unique().tolist(),
+        sub_folder=LSEG_ACTIVE,
+        start_date=min(last_date_stoxx, last_date_spx),
+        end_date=datetime.now().strftime(Y_M_D),
+        inst_name='RIC',
+        skip_existing=False,
+        upsert=True,
+        chunk_size=batch,
+        print_inst=False
     )
-    filtered_prices = data.loc[mask].dropna(subset=[value_col])
+
+
+# ---------- Fetch Saved Data ----------
+
+def get_fundamental_data(inst: str, data_type: DataType = 'active'):
+    config = DATA_CONFIG[data_type]
+    data_dir = os.path.join(FUNDAMENTALS_OUTPUT_DIR, config['sub_dir'])
+    data = pd.read_parquet(os.path.join(data_dir, f"{config['inst_name']}={inst}/part.parquet"))
+    return data
+
+def get_single_timeseries(inst: str | list, value: DataColumns = 'Close', data_type: DataType = 'active'):
+    if isinstance(inst, list):
+        return pd.concat({i: get_single_timeseries(i, value, data_type) for i in inst}, axis=1)
+    config = DATA_CONFIG[data_type]
+    data_dir = os.path.join(PRICE_DATA_OUTPUT_DIR, config['sub_dir'])
+    df = pd.read_parquet(os.path.join(data_dir, f"{config['inst_name']}={inst}/part.parquet"))[['Date', value]]
+    df = df.drop_duplicates(subset=['Date'], keep='last')
+    return df.set_index('Date')[value].dropna()
+
+def get_timeseries(data: pd.DataFrame, value: DataColumns = 'Close', data_type: DataType = 'active', market: Markets = '.SPX'):
+    """Pivot price data into a DataFrame of stocks filtered by index constituents, with the market index in the first column.
+    Single-day holiday gaps are forward-filled.
+
+    Parameters:
+        data: Long-format price data with Date, instrument ID, and price columns.
+        value: Price column to pivot on.
+        data_type: Active (LSEG) or historical (Bloomberg) data source.
+        market: Market index to filter constituents by and include as first column.
+
+    Returns:
+        Wide DataFrame with Date index, market index as first column, and constituent prices.
+    """
+    inst_name = DATA_CONFIG[data_type]['inst_name']
+    if data_type=='historical':
+        constituents = get_bloomberg_historical_constituents()
+        constituents = constituents[constituents['Index'] == market]
+        constituents_years = constituents[[inst_name, 'Year']].drop_duplicates()
+
+        data_with_year = data.assign(Year=data['Date'].dt.year)
+        data_with_year = data_with_year[data_with_year[inst_name].isin(constituents[inst_name])]
+        filtered_prices = (
+            data_with_year.merge(constituents_years, on=[inst_name, 'Year'], how='inner')
+                .drop(columns='Year')
+                .dropna(subset=[value])
+        )
+    else:
+        constituents = get_lseg_active_constituents()
+        constituents = constituents[constituents['Index'] == market]
+        filtered_prices = data[data[inst_name].isin(constituents[inst_name])].dropna(subset=[value])
 
     # Include index data
-    index_prices = data[data['RIC']==index][['Date', value_col]].set_index('Date')[value_col]
+    index_prices = get_single_timeseries(inst=market, data_type='active')
     
-    df = filtered_prices.drop_duplicates(subset=['RIC', 'Date'], keep='first')
-    df = df.pivot(index="Date", columns="RIC", values=value_col).sort_index()
-    df.insert(0, index, index_prices)
+    df = filtered_prices.drop_duplicates(subset=[inst_name, 'Date'], keep='last')
+    df = df.pivot(index="Date", columns=inst_name, values=value).sort_index()
 
     # Filter on only trading days, i.e. index Close price exists
-    valid_days = data[data['RIC']==index][['Date', 'Close']].set_index('Date')['Close'].dropna().index
-    df = df.loc[df.index.intersection(valid_days)]
+    df = df.loc[df.index.intersection(index_prices.index)]
+
+    # drop index column if it somehow exists already
+    df = df.drop(columns=market, errors='ignore')
+
+    # now safe to insert
+    df.insert(0, market, index_prices)
+
+    # Fill holidays
+    df = df.ffill(limit=1)
     
     return df
 
-def eligible_to_trade(prices_df: pd.DataFrame, vol_df: pd.DataFrame, adv_threshold: float = 5e6, index: str = '.SPX') -> pd.DataFrame:
+def eligible_to_trade(prices_df: pd.DataFrame, vol_df: pd.DataFrame, ADV_threshold: float = 5e6, market: Markets = '.SPX') -> pd.DataFrame:
     """Boolean DataFrame, True where stock has sufficient liquidity to trade.
     ADV = rolling 60-day mean of currency volume (Close * Volume)."""
     
-    currency_volume = vol_df.multiply(prices_df, fill_value=0)
+    currency_volume = vol_df * prices_df
     adv = currency_volume.shift(1).rolling(60, min_periods=1).sum() / 60
 
-    eligible = adv >= adv_threshold
-    eligible[index] = False  # index itself is never tradeable
+    eligible = adv >= ADV_threshold
+    eligible[market] = True  # market index itself is always tradeable
     
     return eligible
 
@@ -482,48 +616,15 @@ if __name__ == '__main__':
         format='%(asctime)s | %(levelname)s | %(message)s'
     )
 
-    # Daily update: Upsert daily price/volume data
-
-    
-    def get_price_data_for_rics_in_mapping_file():
-        stoxx = get_data(['0#.STOXX'])
-        rua = get_data(['0#.SPX'])
-
-        stoxx['Instrument'].drop_duplicates().reset_index(drop=True)
-        rua['Instrument'].drop_duplicates().reset_index(drop=True)
-
-        data_rics = [entry.name.split("RIC=")[1] for entry in os.scandir(PRICE_DATA_OUTPUT_DIR) if entry.is_dir()]
-
-        isin_ric_mapping = pd.read_csv(os.path.join(DATA_DIR, 'isin_ric_mapping.csv'))
-        mapping_rics_not_downloaded = isin_ric_mapping[~isin_ric_mapping['RIC'].isin(data_rics)]['RIC'].dropna().unique().tolist()
-        
-        download_all(
-            rics=mapping_rics_not_downloaded,#all_instruments,
-            start_date='2000-01-01',#last_date_of_data.strftime('%Y-%m-%d'), 
-            end_date=date.today().strftime('%Y-%m-%d'), 
-            upsert=True, 
-            chunk_size=1, 
-            skip_existing=True, 
-            print_ric=True
-        )
-
-    def daily_update():
-        isin_ric_mapping = pd.read_csv(os.path.join(DATA_DIR, 'isin_ric_mapping.csv'))['RIC'].dropna().unique().tolist()
-        existing_rics = [f.split("RIC=")[1] for f in os.listdir(PRICE_DATA_OUTPUT_DIR) if "RIC=" in f]
-        
-        traded_instruments = sorted(list(set(isin_ric_mapping).union(set(existing_rics))))
-
-        all_instruments = traded_instruments + ['.SPX', '.STOXX', '.STOXX50E']
-
-        # last_date_of_data = pd.read_parquet(f"data/lseg/RIC=.STOXX50E").dropna(subset=['Close']).iloc[-1].Date
-        download_all(
-            rics=all_instruments,
-            start_date='2026-03-29',#last_date_of_data.strftime('%Y-%m-%d'), 
-            end_date=date.today().strftime('%Y-%m-%d'), 
-            upsert=True,
-            chunk_size=200, 
-            skip_existing=False, 
-            print_ric=True
-        )
-
-    daily_update()
+    download_all_data(
+        active_price_data=False,                  # 2-3 hours?
+        historical_price_data=False,              # 12-18 hours?
+        active_fundamentals=True, 
+        historical_fundamentals=False,
+        fundamentals_batch=50,                    # Number of stocks to fetch in one call
+        start_date='2000-01-01',                  # Applies to all data fetched
+        skip_existing=True,
+        sample_size=None,                         # Max number of stocks to write data for
+        update_lseg_active_constituents=False,    # 10 min?
+        update_bb_historical_constituents=False   # 30 min?
+    )
