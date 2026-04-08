@@ -630,7 +630,7 @@ if __name__ == '__main__':
         historical_price_data=False,              # 12-18 hours?
         active_fundamentals=True, 
         historical_fundamentals=True,
-        fundamentals_batch=10,                     # Number of stocks to fetch in one call
+        fundamentals_batch=10,                    # Number of stocks to fetch in one call
         start_date='2000-01-01',                  # Applies to all data fetched
         skip_existing=True,
         sample_size=None,                         # Max number of stocks to write data for
