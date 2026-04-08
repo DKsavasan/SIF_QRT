@@ -6,6 +6,7 @@ Equity trading with US (Russell 3000) and EU (Stoxx 600) universes.
 
 1. Connect to LSEG workspace
 2. Run `download_all_data()` and `update_price_data()` in `LSEG_data.py`
+3. Move `qsec-client/` to `qsec_client/` in the root directory of this project
 
 ## Files
 

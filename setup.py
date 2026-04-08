@@ -8,27 +8,12 @@ setup(
     python_requires=">=3.10",
     install_requires=[
         "pandas",
-        "sqlalchemy",
-        "psycopg2-binary",
-        "asyncpg",
+        "numpy",
+        "matplotlib",
+        "cvxpy",
         "python-dotenv",
-        "fredapi",
+        "scikit-learn",
         "yfinance",
-        "quantstats",
-        "wrds",
-    ],
-    extras_require={
-        "plots": ["matplotlib", "plotly"],
-        "ml": ["scikit-learn", "sympy"],
-        "notebooks": ["nbconvert", "rpy2", "streamlit"],
-        "all": [
-            "matplotlib",
-            "plotly",
-            "scikit-learn",
-            "sympy",
-            "nbconvert",
-            "rpy2",
-            "streamlit",
-        ],
-    },
+        "pyarrow",
+    ]
 )

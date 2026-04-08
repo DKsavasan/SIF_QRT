@@ -3,7 +3,7 @@ __pycache__/
 .venv/
 .DS_Store
 logs/
-qsec-client/
+qsec_client/
 target_files/
 ideas/
 QRT.egg-info/

@@ -8,7 +8,7 @@ from constants import *
 import matplotlib.pyplot as plt
 from functools import lru_cache
 from local_data.LSEG_data import *
-from clients.qsec_client.sample_code import *
+from qsec_client.sample_code import *
 
 logger = logging.getLogger(__name__)
 
