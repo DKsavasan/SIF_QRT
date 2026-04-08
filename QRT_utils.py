@@ -36,6 +36,7 @@ def send_new_portfolio(positions: pd.Series, region: Regions, validate_only: boo
         .reset_index(name='target_notional')
         .assign(currency=currency)
         .sort_values('target_notional', ascending=False, ignore_index=True)
+        .assign(internal_code=lambda df: df['internal_code'].astype(str))
     )
 
     target_path = prepare_targets_file(targets, GROUP_ID, region, os.path.join(TARGETS_DIR, region))
@@ -85,11 +86,10 @@ def beta(inst: str, market: Markets, data_type: DataType = 'active') -> float | 
         logger.info(f"Data not found for {config['inst_name']}={inst}")
         return None
 
-    stock_return = pd.read_parquet(os.path.join(PRICE_DIR, config['sub_dir'], f"{config['inst_name']}={inst}")).set_index("Date")['Close'].dropna().pct_change().tail(250).dropna()
     benchmark_return = pd.read_parquet(os.path.join(PRICE_DIR, config['sub_dir'], f"RIC={market}")).set_index("Date")['Close'].dropna().pct_change().tail(250).dropna()
 
     if len(benchmark_return) < 3 or stock_return.index[-1] < benchmark_return.index[-3]:
-        print(f"Skipping {inst}: last trade {stock_return.index[-1]} is before {benchmark_return.index[-2]}")
+        logger.info(f"Skipping {inst}: last trade {stock_return.index[-1]} is before {benchmark_return.index[-2]}")
         return None
 
     # beta = cov(stock, mkt) / var(mkt)
@@ -132,15 +132,15 @@ def forced_hedge(positions: pd.Series, market: Markets) -> float:
     return hedge.round(2)
 
 def risk(positions: pd.Series, date: str = None, data_type: DataType = 'active') -> int:
-    """Annualised volatility of daily PnL in currency units using previous 60 trading days of returns
-    QRT calculation for the portfolio risk
+    """Annualised volatility or notational risk of daily PnL in currency units using previous 60 
+    trading days of returns QRT calculation for the portfolio risk
 
     Parameters:
-        positions: RIC-to-value (currency) Series e.g. pd.Series({'AAPL': -2500, 'V': 4000}).
+        positions: or weights of RIC-to-value (currency) Series e.g. pd.Series({'AAPL': -2500, 'V': 4000}).
         date: Close date to measure risk exposure for.
         data_type: Active or historical data.
     Returns:
-        int: Nominal risk exposure.
+        float: Nominal risk exposure or volatility if weights.
     """
     if date is None:
         date = pd.Timestamp.now().strftime("%Y-%m-%d")
@@ -154,26 +154,19 @@ def risk(positions: pd.Series, date: str = None, data_type: DataType = 'active')
         df = pd.read_parquet(
             os.path.join(PRICE_DIR, config['sub_dir'], f"{config['inst_name']}={ric}")
         ).set_index("Date")[['Close']]
-
         df.index = pd.to_datetime(df.index)
-        df = df[~df.index.duplicated(keep='first')]
-        df = df.dropna()
+        df = df[~df.index.duplicated(keep='first')].dropna()
 
         # strictly last 60 days of returns from date
-        prices = df.loc[:date]
-        rets = prices.pct_change().dropna().tail(60)
-
+        rets = df.loc[:date].pct_change().dropna().tail(60)
         returns.append(rets.rename(columns={'Close': ric}))
 
     # Fill na with zero for different holidays
-    returns_matrix = pd.concat(returns, axis=1).fillna(0)
-    returns_matrix = returns_matrix[positions.index]
+    returns_matrix = pd.concat(returns, axis=1)[positions.index].fillna(0)
 
     daily_pnl = returns_matrix @ positions
 
-    risk = daily_pnl.std(ddof=1) * np.sqrt(252)
-
-    return int(risk.round())
+    return float(daily_pnl.std(ddof=1) * np.sqrt(252))
 
 def load_returns_from(insts: pd.Index | list, start: str = '2026-01-01', data_type: DataType = 'active') -> pd.DataFrame:
     """Get daily returns DataFrame from local data, one column per Instrument
@@ -215,19 +208,20 @@ def load_returns_from(insts: pd.Index | list, start: str = '2026-01-01', data_ty
 
     return returns_df
 
-def plot_portfolio_returns(positions: pd.Series, market: Markets, start_date: str = '2026-01-01', data_type: DataType = 'active', benchmark: pd.Series = None, figsize=(10, 5)):
+def plot_portfolio_returns(positions: pd.Series, benchmark: Markets | pd.Series, start_date: str = '2026-01-01', data_type: DataType = 'active', figsize=(10, 5)):
     """Plot cumulative portfolio returns (%) since start_date.
 
     Parameters:
-        positions: Portfolio notional amounts indexed by Instrument, e.g. pd.Series({'AAPL.OQ': 500_000, 'V.N': -400_000}).
-        market: Market identifier used as default benchmark if none provided.
+        positions: Signed weights or notional amounts indexed by Instrument, e.g. pd.Series({'AAPL.OQ': 500_000, 'V.N': -400_000}).
+        benchmark: Market identifier or series of notional positions indexed by instrument for the benchmark portfolio.
         start_date: Date to start calculating returns from, assuming bought at close. First plotted point has zero cumulative return.
         data_type: Active or historical data.
-        benchmark: Notional amounts indexed by Instrument for the benchmark portfolio. Defaults to a unit position in the given market.
         figsize: Matplotlib figure size tuple.
     """
-    if benchmark is None:
-        benchmark = pd.Series({market: 1})
+    if isinstance(benchmark, pd.Series):
+        bench_positions = benchmark
+    else:
+        bench_positions = pd.Series({benchmark: 1})
 
     def cum_returns(returns_df: pd.DataFrame, pos: pd.Series) -> pd.Series:
         returns_df = returns_df[pos.index]
@@ -243,13 +237,13 @@ def plot_portfolio_returns(positions: pd.Series, market: Markets, start_date: st
     port_cum = cum_returns(port_returns_df, positions[port_returns_df.columns])
 
     # Benchmark
-    bench_returns_df = load_returns_from(insts=benchmark.index, start=start_date, data_type=data_type)
-    bench_cum = cum_returns(bench_returns_df, benchmark)
+    bench_returns_df = load_returns_from(insts=bench_positions.index, start=start_date, data_type=data_type)
+    bench_cum = cum_returns(bench_returns_df, bench_positions)
 
     # Plot
     plt.figure(figsize=figsize)
     plt.plot(port_cum.index, port_cum.values * 100, label='Portfolio')
-    plt.plot(bench_cum.index, bench_cum.values * 100, label=f'Benchmark ({", ".join(benchmark.index)})', linestyle='--')
+    plt.plot(bench_cum.index, bench_cum.values * 100, label=f'Benchmark ({", ".join(bench_positions.index)})', linestyle='--')
     plt.title(f'Portfolio vs Benchmark Cumulative Return since {start_date}')
     plt.xlabel('Date')
     plt.ylabel('Cumulative Return (%)')
@@ -298,18 +292,13 @@ def eur_usd(date: str | None = None) -> float:
     Returns:
         float: Exchange rate value
     """
-    today = datetime.now().strftime(Y_M_D) if date is None else date
+    today = str(datetime.now().date()) if date is None else date
     fx_rate = yf.download(
-        "EURUSD=X", start=today, end=today, auto_adjust=True, progress=False
+        "EURUSD=X", end=today, auto_adjust=True, progress=False
     )['Close']['EURUSD=X'].iloc[-1]
     return float(fx_rate)
 
-if __name__ == '__main__':    
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
-    logger.addHandler(logging.StreamHandler())
-
+if __name__ == '__main__':
     pos = most_recent_positions('EMEA')
     print(len(pos.index))
     print(portfolio_beta(pos, market='.SPX'))
-    print(send_new_portfolio(pos, 'EMEA'))

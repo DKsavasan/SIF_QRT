@@ -7,3 +7,5 @@ qsec-client/
 target_files/
 ideas/
 QRT.egg-info/
+backtest_results/*.csv
+testing.ipynb

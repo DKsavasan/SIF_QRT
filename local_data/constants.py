@@ -31,8 +31,6 @@ US_INDEX_BENCHMARK, EU_INDEX_BENCHMARK = '.SPX', '.STOXX50E'
 INDEX_NAME_MAPPING = {'RAY': US_INDEX_BENCHMARK, 'SXXP': EU_INDEX_BENCHMARK}
 DAILY_DATA_FIELDS = ["TR.PriceClose", "TR.Volume"]
 
-Y_M_D = '%Y-%m-%d'
-
 FUNDAMENTAL_METRICS_QUARTERLY = [
     "TR.RevenueActValue(Period=FQ0)",        # Revenue
     "TR.COGSActValue(Period=FQ0)",           # Cost of Goods Sold

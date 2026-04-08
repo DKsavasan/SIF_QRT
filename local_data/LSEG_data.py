@@ -390,7 +390,7 @@ def download_all_prices(instruments, sub_folder, start_date, end_date, inst_name
     finally:
         ld.close_session()
 
-def save_fundamental_data(instruments: list, sub_folder: str, start_date: str = '2000-01-01', inst_name: str = 'RIC', batch: int = 10, sample_size: int = None, skip_existing=False):
+def save_fundamental_data(instruments: list, sub_folder: str, start_date: str = '2000-01-01', inst_name: str = 'RIC', batch: int = 10, sample_size: int = None, skip_existing: bool = False, max_retries: int = 3):
     """
     Rewrites all fundamentals data for the specified instruments.
     """
@@ -406,7 +406,17 @@ def save_fundamental_data(instruments: list, sub_folder: str, start_date: str = 
         if not instrument_chunk and skip_existing:
             continue
 
-        df = get_history(instrument_chunk, fields=FUNDAMENTAL_METRICS_QUARTERLY, start=start_date)
+        for attempt in range(1, max_retries + 1):
+            try:
+                df = get_history(instrument_chunk, fields=FUNDAMENTAL_METRICS_QUARTERLY, start=start_date)
+                break
+            except Exception as e:
+                if attempt < max_retries:
+                    logger.warning(f"Attempt {attempt} failed for {instrument_chunk}: {e}. Retrying in 30s...")
+                    time.sleep(30)
+                else:
+                    logger.error(f"All {max_retries} attempts failed for {instrument_chunk}: {e}")
+                    continue
 
         instrument_cols = df.columns.levels[0] if isinstance(df.columns, pd.MultiIndex) else instrument_chunk
         df = df.apply(pd.to_numeric, errors='coerce')
@@ -460,7 +470,7 @@ def download_all_data(
             instruments=lseg_active_rics + [EU_INDEX_BENCHMARK, US_INDEX_BENCHMARK],
             sub_folder=LSEG_ACTIVE,
             start_date=start_date,
-            end_date=datetime.now().strftime(Y_M_D),
+            end_date=str(datetime.now().date()),
             inst_name='RIC',
             skip_existing=skip_existing,
             upsert=True,
@@ -486,7 +496,7 @@ def download_all_data(
             instruments=bb_historical_inst,
             sub_folder=BB_HISTORICAL,
             start_date=start_date,
-            end_date=datetime.now().strftime(Y_M_D),
+            end_date=str(datetime.now().date()),
             inst_name='ISIN',
             skip_existing=skip_existing,
             upsert=True,
@@ -517,10 +527,10 @@ def update_price_data(batch: int=5000):
     last_date_spx = pd.read_parquet(os.path.join(lseg_active_dir, f"RIC={US_INDEX_BENCHMARK}")).dropna(subset=['Close']).iloc[-1].Date
 
     download_all_prices(
-        instruments=lseg_active.RIC.unique().tolist(),
+        instruments=lseg_active.RIC.unique().tolist() + [EU_INDEX_BENCHMARK, US_INDEX_BENCHMARK] ,
         sub_folder=LSEG_ACTIVE,
         start_date=min(last_date_stoxx, last_date_spx),
-        end_date=datetime.now().strftime(Y_M_D),
+        end_date=str(datetime.now().date()),
         inst_name='RIC',
         skip_existing=False,
         upsert=True,
@@ -611,17 +621,16 @@ def eligible_to_trade(prices_df: pd.DataFrame, vol_df: pd.DataFrame, ADV_thresho
 
 
 if __name__ == '__main__':    
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s | %(levelname)s | %(message)s'
-    )
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+
+    update_price_data()
 
     download_all_data(
         active_price_data=False,                  # 2-3 hours?
         historical_price_data=False,              # 12-18 hours?
         active_fundamentals=True, 
-        historical_fundamentals=False,
-        fundamentals_batch=50,                    # Number of stocks to fetch in one call
+        historical_fundamentals=True,
+        fundamentals_batch=10,                     # Number of stocks to fetch in one call
         start_date='2000-01-01',                  # Applies to all data fetched
         skip_existing=True,
         sample_size=None,                         # Max number of stocks to write data for
