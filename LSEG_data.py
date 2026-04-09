@@ -2,14 +2,12 @@ import os
 import re
 import time
 import logging
-import numpy as np
 import pandas as pd
 import pyarrow as pa
 import lseg.data as ld
-from .constants import *
-from typing import Literal
+from constants import *
 import pyarrow.parquet as pq
-from datetime import date, datetime
+from datetime import datetime
 
 
 pd.set_option('future.no_silent_downcasting', True)
@@ -17,8 +15,8 @@ logger = logging.getLogger(__name__)
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(_SCRIPT_DIR, DATA)
-PRICE_DATA_OUTPUT_DIR = os.path.join(DATA_DIR, PRICE_VOLUME)
-FUNDAMENTALS_OUTPUT_DIR = os.path.join(DATA_DIR, FUNDAMENTALS)
+PRICE_DIR = os.path.join(DATA_DIR, PRICE_VOLUME)
+FUNDAMENTALS_DIR = os.path.join(DATA_DIR, FUNDAMENTALS)
 
 
 # ---------- LSEG SDK Functions ---------- #
@@ -236,8 +234,8 @@ def save_lseg_active_constituents(print_only: bool = False) -> None:
     """
     logger.info("Fetching lseg active constituents...")
     # Fetch all active RUA/STOXX constituents from lseg
-    active_rua = get_data([US_UNIVERSE], fields=["TR.ISIN", "TR.CommonName"]).assign(Index=US_INDEX_BENCHMARK)
-    active_stoxx = get_data([EU_UNIVERSE], fields=["TR.ISIN", "TR.CommonName"]).assign(Index=EU_INDEX_BENCHMARK)
+    active_rua = get_data([RUA.universe], fields=["TR.ISIN", "TR.CommonName"]).assign(Index=US_INDEX_BENCHMARK)
+    active_stoxx = get_data([STOXX.universe], fields=["TR.ISIN", "TR.CommonName"]).assign(Index=EU_INDEX_BENCHMARK)
     lseg_active_rics = pd.concat(
         [active_rua, active_stoxx]
     ).rename(columns={'Company Common Name': 'Name', 'Instrument': 'RIC'})[['Index', 'RIC', 'ISIN', 'Name']]
@@ -307,7 +305,7 @@ def _fetch_chunk_with_retry(chunk, start_date, end_date, max_retry: int = 1, ret
 
 def _write_parquet_incremental(df, inst, sub_folder, inst_name='RIC', upsert=False) -> None:
     """Append or create parquet file for a single instrument."""
-    folder = os.path.join(PRICE_DATA_OUTPUT_DIR, sub_folder, f"{inst_name}={inst}")
+    folder = os.path.join(PRICE_DIR, sub_folder, f"{inst_name}={inst}")
     os.makedirs(folder, exist_ok=True)
     file_path = os.path.join(folder, f"part.parquet")
 
@@ -341,7 +339,7 @@ def download_all_prices(instruments, sub_folder, start_date, end_date, inst_name
     try:
         for chunk in _chunk_list(instruments, chunk_size):
             if skip_existing:
-                folder = os.path.join(PRICE_DATA_OUTPUT_DIR, sub_folder, f"{inst_name}={chunk[0]}")
+                folder = os.path.join(PRICE_DIR, sub_folder, f"{inst_name}={chunk[0]}")
                 file_path = os.path.join(folder, "part.parquet")
 
                 if os.path.exists(file_path):
@@ -390,22 +388,24 @@ def download_all_prices(instruments, sub_folder, start_date, end_date, inst_name
     finally:
         ld.close_session()
 
-def save_fundamental_data(instruments: list, sub_folder: str, start_date: str = '2000-01-01', inst_name: str = 'RIC', batch: int = 10, sample_size: int = None, skip_existing: bool = False, max_retries: int = 3):
+def save_fundamental_data(instruments: list, sub_folder: str, start_date: str = '2000-01-01', inst_name: str = 'RIC', batch: int = 10, sample_size: int = None, skip_existing: bool = False, upsert: bool = True, max_retries: int = 3):
     """
     Rewrites all fundamentals data for the specified instruments.
     """
     logger.info(f"Fetching fundamental data for {len(instruments)} {inst_name}'s...")
     existing_insts = set()
-    os.makedirs(os.path.join(FUNDAMENTALS_OUTPUT_DIR, sub_folder), exist_ok=True)
-    for f in os.listdir(os.path.join(FUNDAMENTALS_OUTPUT_DIR, sub_folder)):
+    os.makedirs(os.path.join(FUNDAMENTALS_DIR, sub_folder), exist_ok=True)
+    for f in os.listdir(os.path.join(FUNDAMENTALS_DIR, sub_folder)):
         assert f.startswith(f"{inst_name}="), f"Unexpected file in folder: {f}"
         existing_insts.add(f.split(f"{inst_name}=")[1])
 
     c=0
     for instrument_chunk in _chunk_list(instruments, batch):
-        instrument_chunk = [inst for inst in instrument_chunk if inst not in existing_insts]
-        if not instrument_chunk and skip_existing:
-            continue
+
+        if skip_existing:
+            instrument_chunk = [inst for inst in instrument_chunk if inst not in existing_insts]
+            if not instrument_chunk:
+                continue
 
         for attempt in range(1, max_retries + 1):
             try:
@@ -431,9 +431,16 @@ def save_fundamental_data(instruments: list, sub_folder: str, start_date: str = 
             inst_df = inst_df.dropna(how='all')
             inst_df.sort_index(inplace=True)
 
-            folder = os.path.join(FUNDAMENTALS_OUTPUT_DIR, sub_folder, f"{inst_name}={inst}")
+            folder = os.path.join(FUNDAMENTALS_DIR, sub_folder, f"{inst_name}={inst}")
             os.makedirs(folder, exist_ok=True)
             file_path = os.path.join(folder, f"part.parquet")
+
+            # Upsert
+            if upsert and os.path.exists(file_path):
+                existing = pd.read_parquet(file_path)
+                inst_df = pd.concat([existing, inst_df])
+                inst_df = inst_df[~inst_df.index.duplicated(keep='last')]
+                inst_df.sort_index(inplace=True)
 
             table = pa.Table.from_pandas(inst_df)
             pq.write_table(table, file_path)
@@ -470,7 +477,7 @@ def download_all_data(
     lseg_active_rics = sorted(get_lseg_active_constituents().RIC.unique().tolist())
     if active_price_data:
         download_all_prices(
-            instruments=lseg_active_rics + [EU_INDEX_BENCHMARK, US_INDEX_BENCHMARK],
+            instruments=lseg_active_rics + [RUA.benchmark, STOXX.benchmark],
             sub_folder=LSEG_ACTIVE,
             start_date=start_date,
             end_date=str(datetime.now().date()),
@@ -490,7 +497,8 @@ def download_all_data(
             inst_name='RIC',
             sample_size=sample_size,
             batch=fundamentals_batch,
-            skip_existing=skip_existing
+            skip_existing=skip_existing,
+            upsert=True
         )
     
     bb_historical_inst = sorted(get_bloomberg_historical_constituents().ISIN.unique().tolist())
@@ -516,7 +524,8 @@ def download_all_data(
             inst_name='ISIN',
             sample_size=sample_size,
             batch=fundamentals_batch,
-            skip_existing=skip_existing
+            skip_existing=skip_existing,
+            upsert=True
         )
 
 def update_price_data(batch: int=5000):
@@ -525,12 +534,12 @@ def update_price_data(batch: int=5000):
     """
     lseg_active = get_lseg_active_constituents()
 
-    lseg_active_dir = os.path.join(PRICE_DATA_OUTPUT_DIR, LSEG_ACTIVE)
-    last_date_stoxx = pd.read_parquet(os.path.join(lseg_active_dir, f"RIC={EU_INDEX_BENCHMARK}")).dropna(subset=['Close']).iloc[-1].Date
-    last_date_spx = pd.read_parquet(os.path.join(lseg_active_dir, f"RIC={US_INDEX_BENCHMARK}")).dropna(subset=['Close']).iloc[-1].Date
+    lseg_active_dir = os.path.join(PRICE_DIR, LSEG_ACTIVE)
+    last_date_stoxx = pd.read_parquet(os.path.join(lseg_active_dir, f"RIC={STOXX.benchmark}")).dropna(subset=['Close']).iloc[-1].Date
+    last_date_spx = pd.read_parquet(os.path.join(lseg_active_dir, f"RIC={RUA.benchmark}")).dropna(subset=['Close']).iloc[-1].Date
 
     download_all_prices(
-        instruments=lseg_active.RIC.unique().tolist() + [EU_INDEX_BENCHMARK, US_INDEX_BENCHMARK] ,
+        instruments=lseg_active.RIC.unique().tolist() + [RUA.benchmark, STOXX.benchmark],
         sub_folder=LSEG_ACTIVE,
         start_date=min(last_date_stoxx, last_date_spx),
         end_date=str(datetime.now().date()),
@@ -546,7 +555,7 @@ def update_price_data(batch: int=5000):
 
 def get_fundamental_data(inst: str, data_type: DataType = 'active'):
     config = DATA_CONFIG[data_type]
-    data_dir = os.path.join(FUNDAMENTALS_OUTPUT_DIR, config['sub_dir'])
+    data_dir = os.path.join(FUNDAMENTALS_DIR, config['sub_dir'])
     data = pd.read_parquet(os.path.join(data_dir, f"{config['inst_name']}={inst}/part.parquet"))
     return data
 
@@ -554,12 +563,12 @@ def get_single_timeseries(inst: str | list, value: DataColumns = 'Close', data_t
     if isinstance(inst, list):
         return pd.concat({i: get_single_timeseries(i, value, data_type) for i in inst}, axis=1)
     config = DATA_CONFIG[data_type]
-    data_dir = os.path.join(PRICE_DATA_OUTPUT_DIR, config['sub_dir'])
+    data_dir = os.path.join(PRICE_DIR, config['sub_dir'])
     df = pd.read_parquet(os.path.join(data_dir, f"{config['inst_name']}={inst}/part.parquet"))[['Date', value]]
     df = df.drop_duplicates(subset=['Date'], keep='last')
     return df.set_index('Date')[value].dropna()
 
-def get_timeseries(data: pd.DataFrame, value: DataColumns = 'Close', data_type: DataType = 'active', market: Markets = '.SPX'):
+def get_timeseries(data: pd.DataFrame, value: DataColumns = 'Close', data_type: DataType = 'active', stock_index: type[StockIndex] = RUA):
     """Pivot price data into a DataFrame of stocks filtered by index constituents, with the market index in the first column.
     Single-day holiday gaps are forward-filled.
 
@@ -567,7 +576,7 @@ def get_timeseries(data: pd.DataFrame, value: DataColumns = 'Close', data_type: 
         data: Long-format price data with Date, instrument ID, and price columns.
         value: Price column to pivot on.
         data_type: Active (LSEG) or historical (Bloomberg) data source.
-        market: Market index to filter constituents by and include as first column.
+        stock_index: Stock index: RUA or STOXX.
 
     Returns:
         Wide DataFrame with Date index, market index as first column, and constituent prices.
@@ -575,7 +584,7 @@ def get_timeseries(data: pd.DataFrame, value: DataColumns = 'Close', data_type: 
     inst_name = DATA_CONFIG[data_type]['inst_name']
     if data_type=='historical':
         constituents = get_bloomberg_historical_constituents()
-        constituents = constituents[constituents['Index'] == market]
+        constituents = constituents[constituents['Index'] == stock_index.benchmark]
         constituents_years = constituents[[inst_name, 'Year']].drop_duplicates()
 
         data_with_year = data.assign(Year=data['Date'].dt.year)
@@ -587,11 +596,11 @@ def get_timeseries(data: pd.DataFrame, value: DataColumns = 'Close', data_type: 
         )
     else:
         constituents = get_lseg_active_constituents()
-        constituents = constituents[constituents['Index'] == market]
+        constituents = constituents[constituents['Index'] == stock_index.benchmark]
         filtered_prices = data[data[inst_name].isin(constituents[inst_name])].dropna(subset=[value])
 
     # Include index data
-    index_prices = get_single_timeseries(inst=market, data_type='active')
+    index_prices = get_single_timeseries(inst=stock_index.benchmark, data_type='active')
     
     df = filtered_prices.drop_duplicates(subset=[inst_name, 'Date'], keep='last')
     df = df.pivot(index="Date", columns=inst_name, values=value).sort_index()
@@ -600,25 +609,25 @@ def get_timeseries(data: pd.DataFrame, value: DataColumns = 'Close', data_type: 
     df = df.loc[df.index.intersection(index_prices.index)]
 
     # drop index column if it somehow exists already
-    df = df.drop(columns=market, errors='ignore')
+    df = df.drop(columns=stock_index.benchmark, errors='ignore')
 
     # now safe to insert
-    df.insert(0, market, index_prices)
+    df.insert(0, stock_index.benchmark, index_prices)
 
     # Fill holidays
     df = df.ffill(limit=1)
     
     return df
 
-def eligible_to_trade(prices_df: pd.DataFrame, vol_df: pd.DataFrame, ADV_threshold: float = 5e6, market: Markets = '.SPX') -> pd.DataFrame:
+def eligible_to_trade(prices_df: pd.DataFrame, volume_df: pd.DataFrame, ADV_threshold: float = 5e6, stock_index: type[StockIndex] = RUA) -> pd.DataFrame:
     """Boolean DataFrame, True where stock has sufficient liquidity to trade.
     ADV = rolling 60-day mean of currency volume (Close * Volume)."""
     
-    currency_volume = vol_df * prices_df
+    currency_volume = volume_df * prices_df
     adv = currency_volume.shift(1).rolling(60, min_periods=1).sum() / 60
 
     eligible = adv >= ADV_threshold
-    eligible[market] = True  # market index itself is always tradeable
+    eligible[stock_index.benchmark] = True  # market index itself is always tradeable
     
     return eligible
 
@@ -632,7 +641,7 @@ if __name__ == '__main__':
         active_price_data=False,                  # 2-3 hours?
         historical_price_data=False,              # 12-18 hours?
         active_fundamentals=False, 
-        historical_fundamentals=False,
+        historical_fundamentals=True,
         fundamentals_batch=10,                    # Number of stocks to fetch in one call
         start_date='2000-01-01',                  # Applies to all data fetched
         skip_existing=True,

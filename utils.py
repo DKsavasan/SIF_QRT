@@ -11,23 +11,42 @@ from IPython.display import display
 logger = logging.getLogger(__name__)
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-def generate_results_file_path(strat_name: str, start: str, end: str, reb_freq: int, **strategy_kwargs):
-    """Construct file name from strategy input parameters"""
+def generate_results_file_path(strat_name: str, start: str, end: str, stock_index: StockIndex, reb_freq: int, **strategy_kwargs):
+    """Construct CSV file name from strategy input parameters"""
     backtest_results_dir = os.path.join(_SCRIPT_DIR, BACKTEST_RESULTS)
     os.makedirs(backtest_results_dir, exist_ok=True)
     kw_str = "__".join(f"{k}={repr(v)}" for k, v in sorted(strategy_kwargs.items()))
     suffix = f"__{kw_str}" if kw_str else ""
-    fname = f"{strat_name}__start={start}__end={end}__reb={reb_freq}{suffix}.csv"
+    fname = f"{strat_name}__index={stock_index.name}__start={start}__end={end}__reb={reb_freq}{suffix}.csv"
     return os.path.join(backtest_results_dir, fname)
 
+def summary_statistics(daily_returns: pd.Series, stock_index: StockIndex, rebalance_freq: int):
+    cum_ret = (1 + daily_returns).cumprod() - 1
+    ann_ret = daily_returns.mean() * TRADING_DAYS
+    ann_vol = daily_returns.std() * np.sqrt(TRADING_DAYS)
+    sharpe = ann_ret / ann_vol if ann_vol > 0 else 0
+    max_dd = (cum_ret - cum_ret.cummax()).min()
+
+    return pd.Series({
+        'Index': stock_index.name,
+        'Period': f"{daily_returns.index[0].date()} → {daily_returns.index[-1].date()}",
+        'Cumulative Return': f'{cum_ret.iloc[-1]:.2%}',
+        'Ann. Return': f'{ann_ret:.2%}',
+        'Ann. Vol': f'{ann_vol:.2%}',
+        'Sharpe': f'{sharpe:.2f}',
+        'Max Drawdown': f'{max_dd:.2%}',
+        'Rebalance Freq': rebalance_freq,
+    })
+    
 def backtest(
     strategy_fn: Callable,
     price_data: pd.DataFrame,
     volume_eligible: pd.DataFrame,
+    stock_index: StockIndex,
     start_date: str = None,
     end_date: str = None,
     rebalance_freq: int = 10,
-    save_csv: bool = True,
+    save_results: bool = True,
     plot: bool = True,
     **strategy_kwargs
 ):
@@ -40,10 +59,11 @@ def backtest(
     strategy_fn      : Callable(price_data, volume_eligible, portfolio_start, **kwargs) → (weights, stats)
     price_data       : Price DataFrame with market index as first column.
     volume_eligible  : Boolean DataFrame of dates x RICs where dollar ADV ≥ threshold.
+    stock_index      : Stock index: RUA or STOXX.
     start_date       : Backtest start date. Defaults to first date in price_data.
     end_date         : Backtest end date. Defaults to last date in price_data.
     rebalance_freq   : Trading days between rebalances.
-    save_csv         : Save daily returns to CSV with strategy params in filename.
+    save_results     : Save daily returns to Parquet with strategy params in filename.
     plot             : Show cumulative return chart.
     **strategy_kwargs: Passed through to strategy_fn.
 
@@ -60,103 +80,95 @@ def backtest(
 
     daily_returns = pd.Series(0.0, index=all_dates[start_idx:end_idx], dtype=float)
     prev_weights  = pd.Series(dtype=float)
-    n_rebalances  = 0
 
     backtest_results_file = generate_results_file_path(
         strat_name=strategy_fn.__name__,
         start=str(daily_returns.index[0].date()),
         end=str(daily_returns.index[-1].date()),
+        stock_index=stock_index,
         reb_freq=rebalance_freq,
         **strategy_kwargs
     )
 
-    for i, reb_idx in enumerate(rebal_indices):
-        reb_date = all_dates[reb_idx]
-        next_reb_idx = rebal_indices[i + 1] if i + 1 < len(rebal_indices) else end_idx
+    if not os.path.exists(backtest_results_file):
+        for i, reb_idx in enumerate(rebal_indices):
+            reb_date = all_dates[reb_idx]
+            next_reb_idx = rebal_indices[i + 1] if i + 1 < len(rebal_indices) else end_idx
 
-        try:
-            weights, stats = strategy_fn(
-                price_data=price_data,
-                volume_eligible=volume_eligible,
-                portfolio_start=str(reb_date.date()),
-                **strategy_kwargs
-            )
-        except (ValueError, RuntimeError) as e:
-            logger.info(f"[{reb_date.date()}] Skipping: {e}")
-            continue
+            try:
+                weights, stats = strategy_fn(
+                    price_data=price_data,
+                    volume_eligible=volume_eligible,
+                    portfolio_start=str(reb_date.date()),
+                    **strategy_kwargs
+                )
+            except (ValueError, RuntimeError) as e:
+                logger.info(f"[{reb_date.date()}] Skipping: {e}")
+                continue
 
-        if weights.empty:
-            logger.info("Weights are empty")
-            continue
+            if weights.empty:
+                logger.info("Weights are empty")
+                continue
 
-        n_rebalances += 1
+            # Turnover
+            all_tickers = weights.index.union(prev_weights.index)
+            old = prev_weights.reindex(all_tickers, fill_value=0)
+            new = weights.reindex(all_tickers, fill_value=0)
+            # Change in weights from last rebalance to the next, includes all tickers
+            turnover = (new - old).abs().sum()
 
-        # Turnover
-        all_tickers = weights.index.union(prev_weights.index)
-        old = prev_weights.reindex(all_tickers, fill_value=0)
-        new = weights.reindex(all_tickers, fill_value=0)
-        # Change in weights from last rebalance to the next, includes all tickers
-        turnover = (new - old).abs().sum()
+            # Daily returns for holding period: this rebalance date to the next one
+            hold_returns = price_data.iloc[reb_idx:next_reb_idx].pct_change(fill_method=None).iloc[1:]
+            if hold_returns.empty:
+                continue
 
-        # Daily returns for holding period: this rebalance date to the next one
-        hold_returns = price_data.iloc[reb_idx:next_reb_idx].pct_change(fill_method=None).iloc[1:]
-        if hold_returns.empty:
-            continue
+            # Weighted portfolio return
+            missing = weights.index.difference(hold_returns.columns)
+            if not missing.empty:
+                raise ValueError(f"Weights reference unknown tickers: {list(missing)}")
+            
+            daily_portfolio_rets = (hold_returns[weights.index] * weights).sum(axis=1)
 
-        # Weighted portfolio return
-        missing = weights.index.difference(hold_returns.columns)
-        if not missing.empty:
-            raise ValueError(f"Weights reference unknown tickers: {list(missing)}")
-        
-        daily_portfolio_rets = (hold_returns[weights.index] * weights).sum(axis=1)
+            # Reduce portfolio returns by short position financing costs and execution costs
+            short_weight = weights[weights < 0].abs().sum()
+            daily_portfolio_rets = daily_portfolio_rets - short_weight * FINANCING_COST_ANNUAL / TRADING_DAYS
+            daily_portfolio_rets.iloc[0] -= turnover * EXECUTION_COST_BPS
 
-        # Reduce portfolio returns by short position financing costs and execution costs
-        short_weight = weights[weights < 0].abs().sum()
-        daily_portfolio_rets = daily_portfolio_rets - short_weight * FINANCING_COST_ANNUAL / TRADING_DAYS
-        daily_portfolio_rets.iloc[0] -= turnover * EXECUTION_COST_BPS
+            # Update return series with the portfolio returns in this rebalance period
+            daily_returns.loc[daily_portfolio_rets.index] = daily_portfolio_rets
 
-        # Update return series with the portfolio returns in this rebalance period
-        daily_returns.loc[daily_portfolio_rets.index] = daily_portfolio_rets
-
-        # Drifted weights for the next turnover calculation with prev_weights,
-        # since weights change (drift) over the holding period
-        hold_period_prices = price_data.iloc[reb_idx:next_reb_idx][weights.index]
-        drift_HPR = hold_period_prices.iloc[-1] / hold_period_prices.iloc[0]
-        drifted = weights * drift_HPR
-        gross = drifted.abs().sum()
-        prev_weights = drifted / gross * weights.abs().sum() if gross > 0 else drifted
+            # Drifted weights for the next turnover calculation with prev_weights,
+            # since weights change (drift) over the holding period
+            hold_period_prices = price_data.iloc[reb_idx:next_reb_idx][weights.index]
+            drift_HPR = hold_period_prices.iloc[-1] / hold_period_prices.iloc[0]
+            drifted = weights * drift_HPR
+            gross = drifted.abs().sum()
+            prev_weights = drifted / gross * weights.abs().sum() if gross > 0 else drifted
+    else:
+        daily_returns = pd.read_csv(backtest_results_file, index_col=0, parse_dates=True).squeeze()
 
     # Summary
-    cum_ret = (1 + daily_returns).cumprod() - 1
-    ann_ret = daily_returns.mean() * TRADING_DAYS
-    ann_vol = daily_returns.std() * np.sqrt(TRADING_DAYS)
-    sharpe = ann_ret / ann_vol if ann_vol > 0 else 0
-    max_dd = (cum_ret - cum_ret.cummax()).min()
-
-    summary = pd.Series({
-        'Period': f"{daily_returns.index[0].date()} → {daily_returns.index[-1].date()}",
-        'Cumulative Return': f'{cum_ret.iloc[-1]:.2%}',
-        'Ann. Return': f'{ann_ret:.2%}',
-        'Ann. Vol': f'{ann_vol:.2%}',
-        'Sharpe': f'{sharpe:.2f}',
-        'Max Drawdown': f'{max_dd:.2%}',
-        'Rebalances': n_rebalances,
-    })
+    summary = summary_statistics(daily_returns=daily_returns, stock_index=stock_index, rebalance_freq=rebalance_freq)
 
     if plot:
-        (cum_ret * 100).plot(title='Cumulative Return (%)', figsize=(10, 3))
+        bench_ret = get_single_timeseries(stock_index.benchmark).pct_change(fill_method=None).iloc[1:].reindex(daily_returns.index, fill_value=0)
+        cum_ret = (1 + daily_returns).cumprod() - 1
+        cum_bench = (1 + bench_ret).cumprod() - 1
+        (cum_ret * 100).plot(title='Cumulative Return (%)', figsize=(10, 3), label=f'Strategy ({stock_index.name})')
+        (cum_bench * 100).plot(label=stock_index.benchmark)
         plt.ylabel('Return (%)')
+        plt.legend()
         plt.grid(True)
         plt.tight_layout()
         plt.show()
 
-    if save_csv:
-        daily_returns.to_csv(backtest_results_file, header=True)
-        print(f"Saved: {backtest_results_file}")
+    if save_results and not os.path.exists(backtest_results_file):
+        daily_returns.to_csv(backtest_results_file)
+        logger.info(f"Saved: {backtest_results_file}")
 
     return daily_returns, summary
 
-def scale_portfolio(
+def scale_portfolio_risk(
     weights_rua: pd.Series,
     weights_stoxx: pd.Series,
     target_risk_usd: float = 500_000,
