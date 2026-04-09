@@ -5,41 +5,40 @@ import pandas as pd
 from glob import glob
 import yfinance as yf
 from constants import *
+from LSEG_data import *
 import matplotlib.pyplot as plt
 from functools import lru_cache
-from local_data.LSEG_data import *
 from qsec_client.sample_code import *
 
 logger = logging.getLogger(__name__)
 
 KEY_PATH = os.path.expanduser('~/.ssh/icl05_id_rsa')
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(_SCRIPT_DIR, 'local_data', 'data')
+DATA_DIR = os.path.join(_SCRIPT_DIR, 'data')
 PRICE_DIR = os.path.join(DATA_DIR, 'price_volume')
 TARGETS_DIR = os.path.join(_SCRIPT_DIR, 'target_files')
 
 logging.basicConfig(filename=os.path.join(_SCRIPT_DIR, 'logs/send_portfolio.log'), level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 
 
-def send_new_portfolio(positions: pd.Series, region: Regions, validate_only: bool = True):
+def send_new_portfolio(positions: pd.Series, stock_index: type[StockIndex], validate_only: bool = True):
     """Validate and upload portfolio targets to QRT SFTP for execution at current market prices.
 
     Parameters:
         positions: RIC-to-value (notational) Series
-        region: Trading region: 'AMER' or 'EMEA'.
+        stock_index: Stock index: RUA or STOXX.
         validate_only: If True, validate without uploading.
     """
-    currency = 'USD' if region=='AMER' else 'EUR'
     targets = (
         positions
         .rename_axis('internal_code')
         .reset_index(name='target_notional')
-        .assign(currency=currency)
+        .assign(currency=stock_index.currency)
         .sort_values('target_notional', ascending=False, ignore_index=True)
         .assign(internal_code=lambda df: df['internal_code'].astype(str))
     )
 
-    target_path = prepare_targets_file(targets, GROUP_ID, region, os.path.join(TARGETS_DIR, region))
+    target_path = prepare_targets_file(targets, GROUP_ID, stock_index.region, os.path.join(TARGETS_DIR, stock_index.region))
     logger.info(pd.read_csv(target_path))
     issues = validate_targets_file(target_path)
 
@@ -52,7 +51,7 @@ def send_new_portfolio(positions: pd.Series, region: Regions, validate_only: boo
     try:
         upload_targets_file(
             targets_csv_path=target_path, 
-            region=region, 
+            region=stock_index.region, 
             sftp_username=USER, 
             private_key_path=KEY_PATH,
             sftp_host='sftp.qrt.cloud'
@@ -62,20 +61,20 @@ def send_new_portfolio(positions: pd.Series, region: Regions, validate_only: boo
         logger.error(f"SFTP upload failed: {e}")
         raise
 
-def beta(inst: str, market: Markets, data_type: DataType = 'active') -> float | None:
+def beta(inst: str, stock_index: type[StockIndex], data_type: DataType = 'active') -> float | None:
     """Market beta of a single instrument using trailing 250-day returns.
 
     Computes cov(stock, market) / var(market), then applies the QRT shrinkage formula: 0.2 + 0.8 * β.
 
     Parameters:
         inst: Instrument RIC or ISIN.
-        market: Benchmark market index ('.STOXX50E' or '.SPX').
+        stock_index: Stock index: RUA or STOXX.
         data_type: Active or historical data.
 
     Returns:
         Shrunken beta, 1.0 if inst == market, or None if insufficient data.
     """
-    if inst == market:
+    if inst == stock_index.benchmark:
         return 1.0
     
     config = DATA_CONFIG[data_type]
@@ -86,7 +85,7 @@ def beta(inst: str, market: Markets, data_type: DataType = 'active') -> float | 
         logger.info(f"Data not found for {config['inst_name']}={inst}")
         return None
 
-    benchmark_return = pd.read_parquet(os.path.join(PRICE_DIR, config['sub_dir'], f"RIC={market}")).set_index("Date")['Close'].dropna().pct_change().tail(250).dropna()
+    benchmark_return = pd.read_parquet(os.path.join(PRICE_DIR, config['sub_dir'], f"RIC={stock_index.benchmark}")).set_index("Date")['Close'].dropna().pct_change().tail(250).dropna()
 
     if len(benchmark_return) < 3 or stock_return.index[-1] < benchmark_return.index[-3]:
         logger.info(f"Skipping {inst}: last trade {stock_return.index[-1]} is before {benchmark_return.index[-2]}")
@@ -100,12 +99,12 @@ def beta(inst: str, market: Markets, data_type: DataType = 'active') -> float | 
     # QRT beta calculation
     return 0.2 + 0.8 * float(beta_value)
 
-def portfolio_beta(positions: pd.Series, market: Markets, data_type: DataType = 'active') -> float:
+def portfolio_beta(positions: pd.Series, stock_index: type[StockIndex], data_type: DataType = 'active') -> float:
     """Absolute-value-weighted portfolio beta against a market benchmark.
 
     Parameters:
         positions: RIC-to-value (currency) Series.
-        market: Benchmark market index.
+        stock_index: Stock index: RUA or STOXX.
         data_type: Active or historical data.
 
     Returns:
@@ -118,20 +117,20 @@ def portfolio_beta(positions: pd.Series, market: Markets, data_type: DataType = 
     weights = positions / denom
     total = 0.0
     for inst in positions.index:
-        b = beta(inst=inst, market=market, data_type=data_type)
+        b = beta(inst=inst, stock_index=stock_index, data_type=data_type)
         if b is None:
             continue
         total += weights[inst] * b
     return total
 
-def forced_hedge(positions: pd.Series, market: Markets) -> float:
+def forced_hedge(positions: pd.Series, stock_index: type[StockIndex], data_type: DataType = 'active') -> float:
     """Nominal currency to hedge against beta exposure"""
-    hedge = -portfolio_beta(positions, market) * positions.abs().sum()
+    hedge = -portfolio_beta(positions, stock_index, data_type) * positions.abs().sum()
     if abs(hedge) < 0.01:
         return 0.0
     return hedge.round(2)
 
-def risk(positions: pd.Series, date: str = None, data_type: DataType = 'active') -> int:
+def risk(positions: pd.Series, date: str = None, data_type: DataType = 'active') -> float:
     """Annualised volatility or notational risk of daily PnL in currency units using previous 60 
     trading days of returns QRT calculation for the portfolio risk
 
@@ -208,20 +207,20 @@ def load_returns_from(insts: pd.Index | list, start: str = '2026-01-01', data_ty
 
     return returns_df
 
-def plot_portfolio_returns(positions: pd.Series, benchmark: Markets | pd.Series, start_date: str = '2026-01-01', data_type: DataType = 'active', figsize=(10, 5)):
+def plot_portfolio_returns(positions: pd.Series, stock_index: type[StockIndex] | pd.Series, start_date: str = '2026-01-01', data_type: DataType = 'active', figsize=(10, 5)):
     """Plot cumulative portfolio returns (%) since start_date.
 
     Parameters:
         positions: Signed weights or notional amounts indexed by Instrument, e.g. pd.Series({'AAPL.OQ': 500_000, 'V.N': -400_000}).
-        benchmark: Market identifier or series of notional positions indexed by instrument for the benchmark portfolio.
+        benchmark: StockIndex identifier or series of notional positions indexed by instrument for the benchmark portfolio.
         start_date: Date to start calculating returns from, assuming bought at close. First plotted point has zero cumulative return.
         data_type: Active or historical data.
         figsize: Matplotlib figure size tuple.
     """
-    if isinstance(benchmark, pd.Series):
-        bench_positions = benchmark
+    if isinstance(stock_index.benchmark, pd.Series):
+        bench_positions = stock_index.benchmark
     else:
-        bench_positions = pd.Series({benchmark: 1})
+        bench_positions = pd.Series({stock_index.benchmark: 1})
 
     def cum_returns(returns_df: pd.DataFrame, pos: pd.Series) -> pd.Series:
         returns_df = returns_df[pos.index]
@@ -252,24 +251,24 @@ def plot_portfolio_returns(positions: pd.Series, benchmark: Markets | pd.Series,
     plt.tight_layout()
     plt.show()
 
-def most_recent_positions(region: Regions, pattern: str = "*.csv") -> pd.Series:
+def most_recent_positions(stock_index: type[StockIndex], pattern: str = "*.csv") -> pd.Series:
     """
     Reads the most recent file positions for the region matching the file pattern and returns as a DataFrame.
     
     Parameters:
-        region (Literal['AMER', 'EMEA']): Region of the portfolio.
+        stock_index: Stock index: RUA or STOXX.
         pattern (str): Glob pattern to match files, default '*.csv'.
     
     Returns:
         pd.Series: Series of the most recent file positions.
     """
     # Build full search pattern
-    search_pattern = os.path.join(TARGETS_DIR, region, pattern)
+    search_pattern = os.path.join(TARGETS_DIR, stock_index.region, pattern)
     
     # Get all matching files
     files = glob(search_pattern)
     if not files:
-        raise FileNotFoundError(f"No files found in {TARGETS_DIR}/{region} matching {pattern}")
+        raise FileNotFoundError(f"No files found in {TARGETS_DIR}/{stock_index.region} matching {pattern}")
     
     # Get the most recently added file
     most_recent_file = max(files, key=os.path.getmtime)
@@ -299,6 +298,7 @@ def eur_usd(date: str | None = None) -> float:
     return float(fx_rate)
 
 if __name__ == '__main__':
-    pos = most_recent_positions('EMEA')
+    pos = most_recent_positions(RUA)
+    print(pos.head())
     print(len(pos.index))
-    print(portfolio_beta(pos, market='.SPX'))
+    print(portfolio_beta(pos, stock_index=RUA))
