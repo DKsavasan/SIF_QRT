@@ -11,10 +11,19 @@ from IPython.display import display
 logger = logging.getLogger(__name__)
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+def generate_results_file_path(strat_name: str, start: str, end: str, reb_freq: int, **strategy_kwargs):
+    """Construct file name from strategy input parameters"""
+    backtest_results_dir = os.path.join(_SCRIPT_DIR, BACKTEST_RESULTS)
+    os.makedirs(backtest_results_dir, exist_ok=True)
+    kw_str = "__".join(f"{k}={repr(v)}" for k, v in sorted(strategy_kwargs.items()))
+    suffix = f"__{kw_str}" if kw_str else ""
+    fname = f"{strat_name}__start={start}__end={end}__reb={reb_freq}{suffix}.csv"
+    return os.path.join(backtest_results_dir, fname)
+
 def backtest(
     strategy_fn: Callable,
     price_data: pd.DataFrame,
-    vol_eligible: pd.DataFrame,
+    volume_eligible: pd.DataFrame,
     start_date: str = None,
     end_date: str = None,
     rebalance_freq: int = 10,
@@ -23,14 +32,14 @@ def backtest(
     **strategy_kwargs
 ):
     """Run a backtest for any strategy that returns (weights, stats). Params required for strategy_fn:
-    price_data, vol_eligible, portfolio_start. Also ensure that price_data and vol_eligible are sliced
+    price_data, volume_eligible, portfolio_start. Also ensure that price_data and volume_eligible are sliced
     to select only necessary data.
 
     Parameters
     ----------
-    strategy_fn      : Callable(price_data, vol_eligible, portfolio_start, **kwargs) → (weights, stats)
+    strategy_fn      : Callable(price_data, volume_eligible, portfolio_start, **kwargs) → (weights, stats)
     price_data       : Price DataFrame with market index as first column.
-    vol_eligible     : Boolean DataFrame of dates x RICs where dollar ADV ≥ threshold.
+    volume_eligible  : Boolean DataFrame of dates x RICs where dollar ADV ≥ threshold.
     start_date       : Backtest start date. Defaults to first date in price_data.
     end_date         : Backtest end date. Defaults to last date in price_data.
     rebalance_freq   : Trading days between rebalances.
@@ -53,6 +62,14 @@ def backtest(
     prev_weights  = pd.Series(dtype=float)
     n_rebalances  = 0
 
+    backtest_results_file = generate_results_file_path(
+        strat_name=strategy_fn.__name__,
+        start=str(daily_returns.index[0].date()),
+        end=str(daily_returns.index[-1].date()),
+        reb_freq=rebalance_freq,
+        **strategy_kwargs
+    )
+
     for i, reb_idx in enumerate(rebal_indices):
         reb_date = all_dates[reb_idx]
         next_reb_idx = rebal_indices[i + 1] if i + 1 < len(rebal_indices) else end_idx
@@ -60,7 +77,7 @@ def backtest(
         try:
             weights, stats = strategy_fn(
                 price_data=price_data,
-                vol_eligible=vol_eligible,
+                volume_eligible=volume_eligible,
                 portfolio_start=str(reb_date.date()),
                 **strategy_kwargs
             )
@@ -134,17 +151,8 @@ def backtest(
         plt.show()
 
     if save_csv:
-        backtest_results_path = os.path.join(_SCRIPT_DIR, BACKTEST_RESULTS)
-        os.makedirs(backtest_results_path, exist_ok=True)
-        strat_name = strategy_fn.__name__
-        s = start_date or str(daily_returns.index[0].date())
-        e = end_date or str(daily_returns.index[-1].date())
-
-        # Construct file name from strategy input parameters
-        kw_str = "_".join(f"{k}={v}" for k, v in sorted(strategy_kwargs.items()))
-        fname = f"{strat_name}__start={s}_end={e}_reb={rebalance_freq}_{kw_str}.csv"
-        daily_returns.to_csv(os.path.join(backtest_results_path, fname), header=True)
-        print(f"Saved: {fname}")
+        daily_returns.to_csv(backtest_results_file, header=True)
+        print(f"Saved: {backtest_results_file}")
 
     return daily_returns, summary
 

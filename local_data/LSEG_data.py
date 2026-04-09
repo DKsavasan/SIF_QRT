@@ -396,6 +396,7 @@ def save_fundamental_data(instruments: list, sub_folder: str, start_date: str = 
     """
     logger.info(f"Fetching fundamental data for {len(instruments)} {inst_name}'s...")
     existing_insts = set()
+    os.makedirs(os.path.join(FUNDAMENTALS_OUTPUT_DIR, sub_folder), exist_ok=True)
     for f in os.listdir(os.path.join(FUNDAMENTALS_OUTPUT_DIR, sub_folder)):
         assert f.startswith(f"{inst_name}="), f"Unexpected file in folder: {f}"
         existing_insts.add(f.split(f"{inst_name}=")[1])
@@ -423,6 +424,8 @@ def save_fundamental_data(instruments: list, sub_folder: str, start_date: str = 
 
         for inst in instrument_cols:
             inst_df = df[inst] if isinstance(df.columns, pd.MultiIndex) else df
+            if inst_df.empty:
+                continue
             inst_df.index = inst_df.index.date
             inst_df = inst_df.groupby(inst_df.index).last()
             inst_df = inst_df.dropna(how='all')
@@ -623,13 +626,13 @@ def eligible_to_trade(prices_df: pd.DataFrame, vol_df: pd.DataFrame, ADV_thresho
 if __name__ == '__main__':    
     logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 
-    update_price_data()
+    # update_price_data()
 
     download_all_data(
         active_price_data=False,                  # 2-3 hours?
         historical_price_data=False,              # 12-18 hours?
-        active_fundamentals=True, 
-        historical_fundamentals=True,
+        active_fundamentals=False, 
+        historical_fundamentals=False,
         fundamentals_batch=10,                    # Number of stocks to fetch in one call
         start_date='2000-01-01',                  # Applies to all data fetched
         skip_existing=True,
