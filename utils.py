@@ -11,19 +11,20 @@ from IPython.display import display
 logger = logging.getLogger(__name__)
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-def generate_results_file_path(strat_name: str, start: str, end: str, reb_freq: int, **strategy_kwargs):
+def generate_results_file_path(strat_name: str, start: str, end: str, market: Markets, reb_freq: int, **strategy_kwargs):
     """Construct file name from strategy input parameters"""
     backtest_results_dir = os.path.join(_SCRIPT_DIR, BACKTEST_RESULTS)
     os.makedirs(backtest_results_dir, exist_ok=True)
     kw_str = "__".join(f"{k}={repr(v)}" for k, v in sorted(strategy_kwargs.items()))
     suffix = f"__{kw_str}" if kw_str else ""
-    fname = f"{strat_name}__start={start}__end={end}__reb={reb_freq}{suffix}.csv"
+    fname = f"{strat_name}__mkt={market.split('.')[1]}__start={start}__end={end}__reb={reb_freq}{suffix}.csv"
     return os.path.join(backtest_results_dir, fname)
 
 def backtest(
     strategy_fn: Callable,
     price_data: pd.DataFrame,
     volume_eligible: pd.DataFrame,
+    market: Markets,
     start_date: str = None,
     end_date: str = None,
     rebalance_freq: int = 10,
@@ -40,6 +41,7 @@ def backtest(
     strategy_fn      : Callable(price_data, volume_eligible, portfolio_start, **kwargs) → (weights, stats)
     price_data       : Price DataFrame with market index as first column.
     volume_eligible  : Boolean DataFrame of dates x RICs where dollar ADV ≥ threshold.
+    market           : The market index for the universe of stock prices.
     start_date       : Backtest start date. Defaults to first date in price_data.
     end_date         : Backtest end date. Defaults to last date in price_data.
     rebalance_freq   : Trading days between rebalances.
@@ -66,6 +68,7 @@ def backtest(
         strat_name=strategy_fn.__name__,
         start=str(daily_returns.index[0].date()),
         end=str(daily_returns.index[-1].date()),
+        market=market,
         reb_freq=rebalance_freq,
         **strategy_kwargs
     )
