@@ -1,5 +1,8 @@
 import pytest
-from QRT_utils import *
+import pandas as pd
+
+from qrt.qrt_utils import most_recent_positions, portfolio_beta, forced_hedge, risk, load_returns_from, eur_usd
+from qrt.constants import RUA
 
 pos = most_recent_positions(RUA)
 

@@ -1,22 +1,29 @@
-import os
 import re
 import time
 import logging
 import pandas as pd
 import pyarrow as pa
 import lseg.data as ld
-from constants import *
+from pathlib import Path
 import pyarrow.parquet as pq
 from datetime import datetime
+
+import qrt
+from qrt.constants import (
+    DataType, StockIndex, DataColumns, RUA, STOXX,
+    DATA, PRICE_VOLUME, FUNDAMENTALS, LSEG_ACTIVE, BB_HISTORICAL, DATA_CONFIG,
+    BB_INDEX_CONSTITUENT_FOLDERS, BB_HISTORICAL_CONSTITUENTS_FILE, LSEG_ACTIVE_CONSTITUENTS_FILE, 
+    FUNDAMENTAL_METRICS_QUARTERLY, DAILY_DATA_FIELDS, INDEX_NAME_MAPPING
+)
 
 
 pd.set_option('future.no_silent_downcasting', True)
 logger = logging.getLogger(__name__)
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(_SCRIPT_DIR, DATA)
-PRICE_DIR = os.path.join(DATA_DIR, PRICE_VOLUME)
-FUNDAMENTALS_DIR = os.path.join(DATA_DIR, FUNDAMENTALS)
+_SCRIPT_DIR = Path(qrt.__file__).resolve().parent.parent
+DATA_DIR = _SCRIPT_DIR / DATA
+PRICE_DIR = DATA_DIR / PRICE_VOLUME
+FUNDAMENTALS_DIR = DATA_DIR / FUNDAMENTALS
 
 
 # ---------- LSEG SDK Functions ---------- #
@@ -113,7 +120,8 @@ def _parse_bloomberg_export(folder: str) -> pd.DataFrame:
     - Rows with missing ISIN values are dropped.
     """
     historical_constituents = []
-    for filename in os.listdir(folder):
+    for f in folder.iterdir():
+        filename = f.name
         if not filename.endswith(('.xlsx', '.xls')):
             continue
 
@@ -123,7 +131,7 @@ def _parse_bloomberg_export(folder: str) -> pd.DataFrame:
             continue
 
         try:
-            df = pd.read_excel(os.path.join(folder, filename))
+            df = pd.read_excel(folder / filename)
         except Exception as e:
             logger.warning(f"Failed to read {filename}: {e}")
             continue
@@ -200,7 +208,7 @@ def save_bloomberg_historical_constituents(print_only: bool = False) -> None:
     logger.info("Parsing bloomberg constituents excel files...")
     all_constituents = []
     for folder in BB_INDEX_CONSTITUENT_FOLDERS:
-        folder_path = os.path.join(DATA_DIR, folder)
+        folder_path = DATA_DIR / folder
         constituents_bb = _parse_bloomberg_export(folder=folder_path)
         all_constituents.append(constituents_bb)
 
@@ -217,7 +225,7 @@ def save_bloomberg_historical_constituents(print_only: bool = False) -> None:
         print(bb_constituents.groupby(['Index', 'Year']).nunique())
         print(f"Prepared {len(bb_constituents)} rows, and {len(bb_isins_with_data)} unique bloomberg constituents with data")
     else:
-        bb_constituents.to_csv(os.path.join(DATA_DIR, BB_HISTORICAL_CONSTITUENTS_FILE), index=False)
+        bb_constituents.to_csv(DATA_DIR / BB_HISTORICAL_CONSTITUENTS_FILE, index=False)
         logger.info(f"Saved {len(bb_constituents)} rows, and {len(bb_isins_with_data)} unique bloomberg constituents with data to {BB_HISTORICAL_CONSTITUENTS_FILE}")
 
 def save_lseg_active_constituents(print_only: bool = False) -> None:
@@ -234,8 +242,8 @@ def save_lseg_active_constituents(print_only: bool = False) -> None:
     """
     logger.info("Fetching lseg active constituents...")
     # Fetch all active RUA/STOXX constituents from lseg
-    active_rua = get_data([RUA.universe], fields=["TR.ISIN", "TR.CommonName"]).assign(Index=US_INDEX_BENCHMARK)
-    active_stoxx = get_data([STOXX.universe], fields=["TR.ISIN", "TR.CommonName"]).assign(Index=EU_INDEX_BENCHMARK)
+    active_rua = get_data([RUA.universe], fields=["TR.ISIN", "TR.CommonName"]).assign(Index=RUA.benchmark)
+    active_stoxx = get_data([STOXX.universe], fields=["TR.ISIN", "TR.CommonName"]).assign(Index=STOXX.benchmark)
     lseg_active_rics = pd.concat(
         [active_rua, active_stoxx]
     ).rename(columns={'Company Common Name': 'Name', 'Instrument': 'RIC'})[['Index', 'RIC', 'ISIN', 'Name']]
@@ -249,7 +257,7 @@ def save_lseg_active_constituents(print_only: bool = False) -> None:
         print(lseg_active_rics.groupby('Index').nunique())
         print(f"Prepared {len(lseg_active_rics)} rows containing {len(active_rics_with_data)} RIC's with data")
     else:
-        lseg_active_rics.to_csv(os.path.join(DATA_DIR, LSEG_ACTIVE_CONSTITUENTS_FILE), index=False)
+        lseg_active_rics.to_csv(DATA_DIR / LSEG_ACTIVE_CONSTITUENTS_FILE, index=False)
         logger.info(f"Saved {len(lseg_active_rics)} rows containing {len(active_rics_with_data)} RIC's with data to {LSEG_ACTIVE_CONSTITUENTS_FILE}")
 
 def get_bloomberg_historical_constituents(has_data: bool = True) -> pd.DataFrame:
@@ -261,7 +269,7 @@ def get_bloomberg_historical_constituents(has_data: bool = True) -> pd.DataFrame
     - Year         : int, year of the constituent in the index
     - HasLsegData  : bool, whether the instrument has historical price data
     """
-    df = pd.read_csv(os.path.join(DATA_DIR, BB_HISTORICAL_CONSTITUENTS_FILE))
+    df = pd.read_csv(DATA_DIR / BB_HISTORICAL_CONSTITUENTS_FILE)
     return df[df.HasLsegData==has_data]
 
 def get_lseg_active_constituents(has_data: bool = True) -> pd.DataFrame:
@@ -273,7 +281,7 @@ def get_lseg_active_constituents(has_data: bool = True) -> pd.DataFrame:
     - Name  : str, company common name
     - HasLsegData : bool, whether the instrument has historical price data
     """
-    df = pd.read_csv(os.path.join(DATA_DIR, LSEG_ACTIVE_CONSTITUENTS_FILE))
+    df = pd.read_csv(DATA_DIR / LSEG_ACTIVE_CONSTITUENTS_FILE)
     return df[df.HasLsegData==has_data]
 
 
@@ -305,17 +313,17 @@ def _fetch_chunk_with_retry(chunk, start_date, end_date, max_retry: int = 1, ret
 
 def _write_parquet_incremental(df, inst, sub_folder, inst_name='RIC', upsert=False) -> None:
     """Append or create parquet file for a single instrument."""
-    folder = os.path.join(PRICE_DIR, sub_folder, f"{inst_name}={inst}")
-    os.makedirs(folder, exist_ok=True)
-    file_path = os.path.join(folder, f"part.parquet")
+    folder = PRICE_DIR / sub_folder / f"{inst_name}={inst}"
+    folder.mkdir(parents=True, exist_ok=True)
+    file_path = folder / f"part.parquet"
 
     # Keep only Date, Close, Volume
     df = df[['Date', 'Close', 'Volume']]
     if df.empty:
-        logger.warning(f"Empty data for {inst}: {e}")
+        logger.warning(f"Empty data for {inst}")
         return
 
-    if upsert and os.path.exists(file_path):
+    if upsert and file_path.exists():
         try:
             existing = pq.read_table(file_path).to_pandas()
             # Read existing parquet
@@ -339,10 +347,10 @@ def download_all_prices(instruments, sub_folder, start_date, end_date, inst_name
     try:
         for chunk in _chunk_list(instruments, chunk_size):
             if skip_existing:
-                folder = os.path.join(PRICE_DIR, sub_folder, f"{inst_name}={chunk[0]}")
-                file_path = os.path.join(folder, "part.parquet")
+                folder = PRICE_DIR / sub_folder / f"{inst_name}={chunk[0]}"
+                file_path = folder / "part.parquet"
 
-                if os.path.exists(file_path):
+                if file_path.exists(): 
                     logger.info(f"Skipped existing: {chunk[0]}")
                     continue
 
@@ -394,10 +402,10 @@ def save_fundamental_data(instruments: list, sub_folder: str, start_date: str = 
     """
     logger.info(f"Fetching fundamental data for {len(instruments)} {inst_name}'s...")
     existing_insts = set()
-    os.makedirs(os.path.join(FUNDAMENTALS_DIR, sub_folder), exist_ok=True)
-    for f in os.listdir(os.path.join(FUNDAMENTALS_DIR, sub_folder)):
-        assert f.startswith(f"{inst_name}="), f"Unexpected file in folder: {f}"
-        existing_insts.add(f.split(f"{inst_name}=")[1])
+    (FUNDAMENTALS_DIR / sub_folder).mkdir(parents=True, exist_ok=True)
+    for f in (FUNDAMENTALS_DIR / sub_folder).iterdir():
+        assert f.name.startswith(f"{inst_name}="), f"Unexpected file in folder: {f}"
+        existing_insts.add(f.name.split(f"{inst_name}=")[1])
 
     c=0
     for instrument_chunk in _chunk_list(instruments, batch):
@@ -431,12 +439,12 @@ def save_fundamental_data(instruments: list, sub_folder: str, start_date: str = 
             inst_df = inst_df.dropna(how='all')
             inst_df.sort_index(inplace=True)
 
-            folder = os.path.join(FUNDAMENTALS_DIR, sub_folder, f"{inst_name}={inst}")
-            os.makedirs(folder, exist_ok=True)
-            file_path = os.path.join(folder, f"part.parquet")
+            folder = FUNDAMENTALS_DIR / sub_folder / f"{inst_name}={inst}"
+            folder.mkdir(parents=True, exist_ok=True)
+            file_path = folder / f"part.parquet"
 
             # Upsert
-            if upsert and os.path.exists(file_path):
+            if upsert and file_path.exists():
                 existing = pd.read_parquet(file_path)
                 inst_df = pd.concat([existing, inst_df])
                 inst_df = inst_df[~inst_df.index.duplicated(keep='last')]
@@ -534,9 +542,9 @@ def update_price_data(batch: int=5000):
     """
     lseg_active = get_lseg_active_constituents()
 
-    lseg_active_dir = os.path.join(PRICE_DIR, LSEG_ACTIVE)
-    last_date_stoxx = pd.read_parquet(os.path.join(lseg_active_dir, f"RIC={STOXX.benchmark}")).dropna(subset=['Close']).iloc[-1].Date
-    last_date_spx = pd.read_parquet(os.path.join(lseg_active_dir, f"RIC={RUA.benchmark}")).dropna(subset=['Close']).iloc[-1].Date
+    lseg_active_dir = PRICE_DIR / LSEG_ACTIVE
+    last_date_stoxx = pd.read_parquet(lseg_active_dir / f"RIC={STOXX.benchmark}").dropna(subset=['Close']).iloc[-1].Date
+    last_date_spx = pd.read_parquet(lseg_active_dir / f"RIC={RUA.benchmark}").dropna(subset=['Close']).iloc[-1].Date
 
     download_all_prices(
         instruments=lseg_active.RIC.unique().tolist() + [RUA.benchmark, STOXX.benchmark],
@@ -555,16 +563,16 @@ def update_price_data(batch: int=5000):
 
 def get_fundamental_data(inst: str, data_type: DataType = 'active'):
     config = DATA_CONFIG[data_type]
-    data_dir = os.path.join(FUNDAMENTALS_DIR, config['sub_dir'])
-    data = pd.read_parquet(os.path.join(data_dir, f"{config['inst_name']}={inst}/part.parquet"))
+    data_dir = FUNDAMENTALS_DIR / config['sub_dir']
+    data = pd.read_parquet(data_dir / f"{config['inst_name']}={inst}/part.parquet")
     return data
 
 def get_single_timeseries(inst: str | list, value: DataColumns = 'Close', data_type: DataType = 'active'):
     if isinstance(inst, list):
         return pd.concat({i: get_single_timeseries(i, value, data_type) for i in inst}, axis=1)
     config = DATA_CONFIG[data_type]
-    data_dir = os.path.join(PRICE_DIR, config['sub_dir'])
-    df = pd.read_parquet(os.path.join(data_dir, f"{config['inst_name']}={inst}/part.parquet"))[['Date', value]]
+    data_dir = PRICE_DIR / config['sub_dir']
+    df = pd.read_parquet(data_dir / f"{config['inst_name']}={inst}/part.parquet")[['Date', value]]
     df = df.drop_duplicates(subset=['Date'], keep='last')
     return df.set_index('Date')[value].dropna()
 

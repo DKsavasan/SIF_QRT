@@ -1,21 +1,29 @@
 from typing import Literal, TypedDict
+from dataclasses import dataclass
 
+# Costs & Global Settings
 EXECUTION_COST_BPS = 0.0002
 FINANCING_COST_ANNUAL = 0.005
 TRADING_DAYS = 252
 
 GROUP_ID = 'ICL05'
 USER = 'q8576'
+
 BACKTEST_RESULTS = 'backtest_results'
 DATA = 'data'
 PRICE_VOLUME = 'price_volume'
 FUNDAMENTALS = 'fundamentals'
+
 LSEG_ACTIVE = 'active_lseg'
 BB_HISTORICAL = 'historical_bb'
-LSEG_ACTIVE_CONSTITUENTS_FILE   = 'lseg_active_constituents.csv'
-BB_HISTORICAL_CONSTITUENTS_FILE = 'bb_historical_constituents.csv'
-BB_INDEX_CONSTITUENT_FOLDERS    = ['Russell_3000', 'Stoxx_600']
 
+LSEG_ACTIVE_CONSTITUENTS_FILE = 'lseg_active_constituents.csv'
+BB_HISTORICAL_CONSTITUENTS_FILE = 'bb_historical_constituents.csv'
+BB_INDEX_CONSTITUENT_FOLDERS = ['Russell_3000', 'Stoxx_600']
+
+
+# Index Modeling
+@dataclass(frozen=True)
 class StockIndex:
     name: Literal['RUA', 'STOXX']
     benchmark: Literal['.SPX', '.STOXX50E']
@@ -23,20 +31,25 @@ class StockIndex:
     currency: Literal['USD', 'EUR']
     universe: Literal['0#.RUA', '0#.STOXX']
 
-class RUA(StockIndex):
-    name      = 'RUA'
-    benchmark = '.SPX'
-    region    = 'AMER'
-    currency  = 'USD'
-    universe  = '0#.RUA'
 
-class STOXX(StockIndex):
-    name      = 'STOXX'
-    benchmark = '.STOXX50E'
-    region    = 'EMEA'
-    currency  = 'EUR'
-    universe  = '0#.STOXX'
+RUA = StockIndex(
+    name='RUA',
+    benchmark='.SPX',
+    region='AMER',
+    currency='USD',
+    universe='0#.RUA',
+)
 
+STOXX = StockIndex(
+    name='STOXX',
+    benchmark='.STOXX50E',
+    region='EMEA',
+    currency='EUR',
+    universe='0#.STOXX',
+)
+
+
+# Data Types
 type DataType = Literal['active', 'historical']
 type DataColumns = Literal['Close', 'Volume']
 
@@ -46,10 +59,13 @@ class DataConfigItem(TypedDict):
 
 DATA_CONFIG: dict[DataType, DataConfigItem] = {
     'active': {'sub_dir': LSEG_ACTIVE, 'inst_name': 'RIC'},
-    'historical': {'sub_dir': BB_HISTORICAL, 'inst_name': 'ISIN'}
+    'historical': {'sub_dir': BB_HISTORICAL, 'inst_name': 'ISIN'},
 }
 
-INDEX_NAME_MAPPING = {'RAY': '.SPX', 'SXXP': '.STOXX50E'}
+INDEX_NAME_MAPPING = {
+    'RAY': '.SPX',
+    'SXXP': '.STOXX50E',
+}
 
 DAILY_DATA_FIELDS = ["TR.PriceClose", "TR.Volume"]
 

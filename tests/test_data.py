@@ -1,4 +1,8 @@
-from LSEG_data import *
+from datetime import datetime
+import pandas as pd
+
+from qrt.data import get_data, get_history, get_fundamental_data, get_single_timeseries, get_timeseries, eligible_to_trade, PRICE_DIR
+from qrt.constants import RUA, LSEG_ACTIVE, FUNDAMENTAL_METRICS_QUARTERLY
 
 def test_get_data():
     output_cols = ['Instrument', 'Primary Issue RIC', 'ISIN', 'Company Common Name']
@@ -19,12 +23,12 @@ def test_get_single_timeseries():
 
 def test_get_timeseries():
     spx = RUA.benchmark
-    df = pd.read_parquet(os.path.join(PRICE_DIR, LSEG_ACTIVE, f"RIC={spx}/part.parquet")).assign(RIC=spx)
+    df = pd.read_parquet(PRICE_DIR / LSEG_ACTIVE / f"RIC={spx}/part.parquet").assign(RIC=spx)
     assert get_timeseries(df).columns == spx
 
 def test_eligible_to_trade():
     spx = RUA.benchmark
-    df = pd.read_parquet(os.path.join(PRICE_DIR, LSEG_ACTIVE, f"RIC={spx}/part.parquet")).assign(RIC=spx)
+    df = pd.read_parquet(PRICE_DIR / LSEG_ACTIVE / f"RIC={spx}/part.parquet").assign(RIC=spx)
     price  = get_timeseries(df, value='Close')
     volume = get_timeseries(df, value='Volume')
     assert eligible_to_trade(price, volume).columns == spx

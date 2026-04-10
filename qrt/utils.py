@@ -1,24 +1,34 @@
-import os
 import logging
+from pathlib import Path
+from typing import Callable
+
 import numpy as np
 import pandas as pd
-from constants import *
-from QRT_utils import *
-from typing import Callable
 import matplotlib.pyplot as plt
 from IPython.display import display
 
-logger = logging.getLogger(__name__)
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+from qrt.data import get_single_timeseries
+from qrt.qrt_utils import eur_usd, risk
+from qrt.constants import (
+    BACKTEST_RESULTS,
+    TRADING_DAYS,
+    EXECUTION_COST_BPS,
+    FINANCING_COST_ANNUAL,
+    StockIndex,
+)
+import qrt
 
-def generate_results_file_path(strat_name: str, start: str, end: str, stock_index: StockIndex, reb_freq: int, **strategy_kwargs):
+logger = logging.getLogger(__name__)
+_SCRIPT_DIR = Path(qrt.__file__).resolve().parent.parent
+
+def generate_results_file_path(strat_name: str, start: str, end: str, stock_index: StockIndex, reb_freq: int, **strategy_kwargs) -> Path:
     """Construct CSV file name from strategy input parameters"""
-    backtest_results_dir = os.path.join(_SCRIPT_DIR, BACKTEST_RESULTS)
-    os.makedirs(backtest_results_dir, exist_ok=True)
+    backtest_results_dir = _SCRIPT_DIR / BACKTEST_RESULTS
+    backtest_results_dir.mkdir(parents=True, exist_ok=True)
     kw_str = "__".join(f"{k}={repr(v)}" for k, v in sorted(strategy_kwargs.items()))
     suffix = f"__{kw_str}" if kw_str else ""
     fname = f"{strat_name}__index={stock_index.name}__start={start}__end={end}__reb={reb_freq}{suffix}.csv"
-    return os.path.join(backtest_results_dir, fname)
+    return backtest_results_dir / fname
 
 def summary_statistics(daily_returns: pd.Series, stock_index: StockIndex, rebalance_freq: int):
     cum_ret = (1 + daily_returns).cumprod() - 1
@@ -78,7 +88,7 @@ def backtest(
 
     rebal_indices = list(range(start_idx, end_idx, rebalance_freq))
 
-    daily_returns = pd.Series(0.0, index=all_dates[start_idx:end_idx], dtype=float)
+    daily_returns = pd.Series(index=all_dates[start_idx:end_idx], dtype=float)
     prev_weights  = pd.Series(dtype=float)
 
     backtest_results_file = generate_results_file_path(
@@ -90,7 +100,7 @@ def backtest(
         **strategy_kwargs
     )
 
-    if not os.path.exists(backtest_results_file):
+    if not backtest_results_file.exists():
         for i, reb_idx in enumerate(rebal_indices):
             reb_date = all_dates[reb_idx]
             next_reb_idx = rebal_indices[i + 1] if i + 1 < len(rebal_indices) else end_idx
@@ -100,6 +110,7 @@ def backtest(
                     price_data=price_data,
                     volume_eligible=volume_eligible,
                     portfolio_start=str(reb_date.date()),
+                    stock_index=stock_index,
                     **strategy_kwargs
                 )
             except (ValueError, RuntimeError) as e:
@@ -162,7 +173,7 @@ def backtest(
         plt.tight_layout()
         plt.show()
 
-    if save_results and not os.path.exists(backtest_results_file):
+    if save_results and not backtest_results_file.exists():
         daily_returns.to_csv(backtest_results_file)
         logger.info(f"Saved: {backtest_results_file}")
 
