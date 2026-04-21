@@ -48,8 +48,11 @@ STOXX = StockIndex(
     universe='0#.STOXX',
 )
 
+STOCK_INDICES = {'RUA': RUA, 'STOXX': STOXX}
+
 
 # Data Types
+type Region = Literal['AMER', 'EMEA']
 type DataType = Literal['active', 'historical']
 type DataColumns = Literal['Close', 'Volume']
 
