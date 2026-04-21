@@ -1,4 +1,5 @@
 import re
+import wrds
 import time
 import logging
 import pandas as pd
@@ -24,18 +25,30 @@ _SCRIPT_DIR = Path(qrt.__file__).resolve().parent.parent
 DATA_DIR = _SCRIPT_DIR / DATA
 PRICE_DIR = DATA_DIR / PRICE_VOLUME
 FUNDAMENTALS_DIR = DATA_DIR / FUNDAMENTALS
+WRDS_DIR = Path(DATA_DIR / "wrds")
 
 
 # ---------- LSEG SDK Functions ---------- #
 
-def get_data(instruments: list, fields: list = ["TR.PrimaryRIC", "TR.ISIN", "TR.CommonName"], date: str = None):
+def get_data(instruments: list, fields: list = ["TR.PrimaryRIC", "TR.ISIN", "TR.CommonName"], date: str = None, batch_size: int = 5000):
     ld.open_session()
     try:
-        return ld.get_data(
-            universe=instruments,  # RIC'S or ISIN's, ex: ['0#.STOXX', '0#.RUA']
-            fields=fields,
-            parameters={"SDate": '2000-01-01' if date is None else date}
-        )
+        if len(instruments) <= batch_size:
+            return ld.get_data(
+                universe=instruments, # RIC'S or ISIN's, ex: ['0#.STOXX', '0#.RUA']
+                fields=fields,
+                # parameters={"SDate": '2000-01-01' if date is None else date}
+            )
+
+        chunks = []
+        for i in range(0, len(instruments), batch_size):
+            chunk = ld.get_data(
+                universe=instruments[i:i + batch_size],
+                fields=fields,
+                # parameters={"SDate": '2000-01-01' if date is None else date}
+            )
+            chunks.append(chunk)
+        return pd.concat(chunks, ignore_index=True)
     finally:
         ld.close_session()
 
@@ -640,7 +653,164 @@ def eligible_to_trade(prices_df: pd.DataFrame, volume_df: pd.DataFrame, ADV_thre
     return eligible
 
 
-if __name__ == '__main__':    
+# ---------- Fetch WRDS RUA and Options Data ----------
+
+def get_connection():
+    print("Connecting to WRDS...")
+    db = wrds.Connection(wrds_username="dccunning") # UsB)s_@=Fmt_8qy
+    print("Connected.\n")
+    return db
+
+def save_wrds_daily_metrics_rua(start_date: str = '2010-01-01', end_date: str = '2025-01-01'):
+    db = get_connection()
+
+    # This gives you the full RUA-equivalent universe, any date range
+    rua_daily = db.raw_sql(f"""      
+        SELECT a.permno,                   -- CRSP permanent ID, never changes
+            b.ticker,                   -- ticker symbol (can change over time)
+            b.exchcd,                   -- 1=NYSE, 2=AMEX, 3=NASDAQ
+            b.ncusip,                   -- 8-char CUSIP, links to OptionMetrics
+            a.date,                     -- trading date
+            a.ret,                      -- daily holding period return (split/div adjusted)
+            abs(a.prc) as price,        -- closing price (abs because negative = bid/ask mid)
+            a.vol as volume,            -- daily share volume
+            a.shrout * 1000 as shares,  -- shares outstanding (in thousands)
+            abs(a.prc) * a.shrout / 1000 as mktcap_mm,  -- market cap in $MM
+            c.dlret,                    -- delisting return (NULL unless stock delists that day)
+            c.dlstcd                    -- delisting code (200s=merger, 400s=bankruptcy, etc)
+        FROM crsp.dsf AS a
+        INNER JOIN crsp.dsenames AS b
+            ON a.permno = b.permno
+            AND a.date BETWEEN b.namedt AND b.nameendt
+        LEFT JOIN crsp.dsedelist AS c
+            ON a.permno = c.permno
+            AND a.date = c.dlstdt
+        WHERE a.date BETWEEN '{start_date}' AND '{end_date}'
+        AND b.shrcd IN (10, 11)       -- common stock only (no ETFs/ADRs/REITs)
+        AND b.exchcd IN (1, 2, 3)     -- major US exchanges only
+        AND a.prc IS NOT NULL          -- has a price
+    """)
+
+    rua_daily.to_parquet(DATA_DIR / 'wrds/crsp_rua_daily.parquet', index=False, engine='pyarrow')
+    print(f"Rows: {len(rua_daily):,}")
+    print(f"Unique stocks: {rua_daily['permno'].nunique()}")
+    print(f"Date range: {rua_daily['date'].min()} to {rua_daily['date'].max()}")
+    print(f"Size: {Path(DATA_DIR / 'wrds/crsp_rua_daily.parquet').stat().st_size / 1e9:.2f} GB")
+
+def pull_universe(db, n_stocks, permno_filter: list = None):
+    """Top N US common stocks by market cap via CRSP."""
+    print(f"=== Pulling top {n_stocks} stocks by market cap ===")
+
+    permno_clause = ""
+    if permno_filter:
+        permno_str = ",".join([str(int(p)) for p in permno_filter])
+        permno_clause = f"AND a.permno IN ({permno_str})"
+
+    mktcap = db.raw_sql(f"""
+        SELECT a.permno, b.ticker, b.ncusip,
+               abs(a.prc) * a.shrout / 1000 as mktcap_mm
+        FROM crsp.dsf AS a
+        INNER JOIN crsp.dsenames AS b
+            ON a.permno = b.permno
+            AND a.date BETWEEN b.namedt AND b.nameendt
+        WHERE a.date = (SELECT max(date) FROM crsp.dsf)
+          AND b.shrcd IN (10, 11)
+          AND a.prc IS NOT NULL
+          AND a.shrout IS NOT NULL
+          {permno_clause}
+        ORDER BY mktcap_mm DESC
+        LIMIT {n_stocks}
+    """)
+
+    print(f"  Stocks: {len(mktcap)}")
+    print(f"  Mkt cap range: ${mktcap['mktcap_mm'].min():.0f}M - ${mktcap['mktcap_mm'].max():.0f}M")
+    print()
+    return mktcap
+
+def link_to_optionmetrics(db, mktcap):
+    """Map CRSP ncusip -> OptionMetrics secid."""
+    print("=== Linking CRSP -> OptionMetrics via CUSIP ===")
+
+    cusip_str = ",".join([f"'{c}'" for c in mktcap['ncusip'].dropna().tolist()])
+
+    secid_map = db.raw_sql(f"""
+        SELECT DISTINCT secid, ticker, cusip
+        FROM optionm.secnmd
+        WHERE cusip IN ({cusip_str})
+    """)
+
+    secid_map = secid_map.drop_duplicates(subset='secid', keep='last')
+
+    merged = secid_map.merge(
+        mktcap[['ncusip', 'permno', 'ticker', 'mktcap_mm']],
+        left_on='cusip',
+        right_on='ncusip',
+        how='inner',
+        suffixes=('_om', '_crsp')
+    )
+
+    print(f"  Matched: {merged['secid'].nunique()} / {len(mktcap)} stocks")
+    print()
+    return merged
+
+def pull_options(db, secids, year, min_dte, max_dte):
+    """Pull options data for given secids and year."""
+    secid_str = ",".join([str(int(s)) for s in secids])
+
+    print(f"  Querying opprcd{year}...", end=" ", flush=True)
+    t0 = time.time()
+
+    df = db.raw_sql(f"""
+        SELECT secid, date, exdate, cp_flag,
+               strike_price / 1000 as strike,
+               best_bid, best_offer,
+               volume, open_interest,
+               impl_volatility, delta
+        FROM optionm.opprcd{year}
+        WHERE secid IN ({secid_str})
+          AND cp_flag IN ('C', 'P')
+          AND best_bid > 0
+          AND exdate - date BETWEEN {min_dte} AND {max_dte}
+    """)
+
+    elapsed = time.time() - t0
+    print(f"{len(df):,} rows in {elapsed:.0f}s")
+    return df
+
+def main(n_stocks: int = 500, years: list = [2024], min_dte: int = 1, max_dte: int = 30, permno_filter: list = None):
+    db = get_connection()
+
+    try:
+        mktcap = pull_universe(db, n_stocks, permno_filter)
+        secid_map = link_to_optionmetrics(db, mktcap)
+        secids = secid_map['secid'].unique()
+
+        secid_map.to_parquet(WRDS_DIR / "secid_map.parquet", index=False)
+
+        print(f"=== Pulling options data for {len(secids)} stocks across {years} ===")
+        total_rows = 0
+
+        for year in years:
+            df = pull_options(db, secids, year, min_dte, max_dte)
+            out_path = WRDS_DIR / "options" / f"{year}.parquet"
+            df.to_parquet(out_path, index=False)
+            total_rows += len(df)
+            print(f"  Saved {out_path.name}: {out_path.stat().st_size / 1e6:.1f} MB")
+            del df 
+
+        print(f"\n  Total rows across all years: {total_rows:,}")
+        print("Saved: secid_map.parquet")
+
+
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    permnos = pd.read_csv(DATA_DIR / 'tmp.csv').permno.to_list()
+
+    main(n_stocks=1600, years=[2022, 2023, 2024, 2025], permno_filter=permnos)
+
     logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 
     # update_price_data()
@@ -649,7 +819,7 @@ if __name__ == '__main__':
         active_price_data=False,                  # 2-3 hours?
         historical_price_data=False,              # 12-18 hours?
         active_fundamentals=False, 
-        historical_fundamentals=True,
+        historical_fundamentals=False,
         fundamentals_batch=10,                    # Number of stocks to fetch in one call
         start_date='2000-01-01',                  # Applies to all data fetched
         skip_existing=True,

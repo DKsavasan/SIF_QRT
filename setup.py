@@ -15,5 +15,6 @@ setup(
         "scikit-learn",
         "yfinance",
         "pyarrow",
+        "bottleneck"
     ]
 )

@@ -10,7 +10,7 @@ import yfinance as yf
 import matplotlib.pyplot as plt
 
 import qrt
-from qrt.constants import StockIndex, DataType, GROUP_ID, USER, DATA_CONFIG
+from qrt.constants import StockIndex, DataType, GROUP_ID, USER, DATA_CONFIG, Region
 from qsec_client.sample_code import prepare_targets_file, validate_targets_file, upload_targets_file
 
 logger = logging.getLogger(__name__)
@@ -27,44 +27,40 @@ LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(filename=str(LOG_FILE), level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 
 
-def send_new_portfolio(positions: pd.Series, stock_index: StockIndex, validate_only: bool = True):
+def send_new_portfolio(targets: pd.DataFrame, region: Region, submit: bool = False):
     """Validate and upload portfolio targets to QRT SFTP for execution at current market prices.
 
     Parameters:
-        positions: RIC-to-value (notational) Series
-        stock_index: Stock index: RUA or STOXX.
-        validate_only: If True, validate without uploading.
+        targets: df cols: internal_code, target_notional, currency, region, fx_rate, usd_notional
+        region: Stock index region: 'AMER', 'EMEA'
+        submit: If False, validate without uploading.
     """
-    targets = (
-        positions
-        .rename_axis('internal_code')
-        .reset_index(name='target_notional')
-        .assign(currency=stock_index.currency)
-        .sort_values('target_notional', ascending=False, ignore_index=True)
-        .assign(internal_code=lambda df: df['internal_code'].astype(str))
-    )
+    targets = targets[['internal_code', 'target_notional', 'currency']]
 
-    target_path = prepare_targets_file(targets, GROUP_ID, stock_index.region, TARGETS_DIR / stock_index.region)
+    target_path = prepare_targets_file(targets, GROUP_ID, region, TARGETS_DIR / region)
     logger.info(pd.read_csv(target_path))
     issues = validate_targets_file(target_path)
 
     if issues:
+        target_path.unlink(missing_ok=True)
         raise ValueError(f"Validation failed: {issues}, target path: {target_path}")
-    
-    if validate_only:
+
+    if not submit:
+        target_path.unlink(missing_ok=True)
         return
 
     try:
         upload_targets_file(
-            targets_csv_path=target_path, 
-            region=stock_index.region, 
-            sftp_username=USER, 
+            targets_csv_path=target_path,
+            region=region,
+            sftp_username=USER,
             private_key_path=KEY_PATH,
             sftp_host='sftp.qrt.cloud'
         )
         logger.info(f"Portfolio successfully uploaded: {target_path}")
     except Exception as e:
         logger.error(f"SFTP upload failed: {e}")
+        target_path.unlink(missing_ok=True)
         raise
 
 def beta(inst: str, stock_index: StockIndex, data_type: DataType = 'active') -> float:
@@ -129,6 +125,58 @@ def portfolio_beta(positions: pd.Series, stock_index: StockIndex, data_type: Dat
         total += (pos / gross) * b
 
     return float(total)
+
+def position_correlation(pos1: pd.Series, pos2: pd.Series, lookback: int = 252, data_type: DataType = 'active') -> float:
+    """Correlation of two RIC-indexed position series using trailing return history.
+
+    Constructs a return-weighted portfolio return stream for each position series
+    over the last `lookback` days, then returns the Pearson correlation.
+
+    Parameters:
+        pos1: RIC -> weight/notional Series.
+        pos2: RIC -> weight/notional Series.
+        lookback: Number of trading days to compute correlation over.
+        data_type: Active or historical data.
+
+    Returns:
+        Pearson correlation scalar, or None if insufficient data.
+    """
+    config = DATA_CONFIG[data_type]
+
+    def load_returns(ric: str) -> pd.Series | None:
+        try:
+            return (
+                pd.read_parquet(PRICE_DIR / config['sub_dir'] / f"{config['inst_name']}={ric}")
+                .set_index("Date")['Close']
+                .dropna()
+                .pct_change()
+                .tail(lookback)
+                .dropna()
+            )
+        except FileNotFoundError:
+            logger.info(f"Data not found for {ric}")
+            return None
+
+    def portfolio_returns(pos: pd.Series) -> pd.Series:
+        weights = pos / pos.abs().sum()  # normalise
+        streams = {}
+        for ric, w in weights.items():
+            r = load_returns(ric)
+            if r is not None:
+                streams[ric] = r * w
+        if not streams:
+            raise ValueError("No return data found for any RIC in position.")
+        return pd.DataFrame(streams).sum(axis=1)
+
+    r1 = portfolio_returns(pos1)
+    r2 = portfolio_returns(pos2)
+
+    common = r1.index.intersection(r2.index)
+    if len(common) < 3:
+        logger.info(f"Insufficient overlapping dates: {len(common)} days")
+        return None
+
+    return r1.loc[common].corr(r2.loc[common])
 
 def forced_hedge(positions: pd.Series, stock_index: StockIndex, data_type: DataType = 'active') -> float:
     """Nominal currency to hedge against beta exposure"""
@@ -214,7 +262,7 @@ def load_returns_from(insts: pd.Index | list, start: str = '2026-01-01', data_ty
 
     return returns_df
 
-def plot_portfolio_returns(positions: pd.Series, stock_index: StockIndex | pd.Series, start_date: str = '2026-01-01', data_type: DataType = 'active', figsize=(10, 5)):
+def plot_portfolio_returns(positions: pd.Series, stock_index: StockIndex | pd.Series, start_date: str = '2026-01-01', data_type: DataType = 'active', figsize=(10, 3)):
     """Plot cumulative portfolio returns (%) since start_date.
 
     Parameters:
@@ -258,7 +306,7 @@ def plot_portfolio_returns(positions: pd.Series, stock_index: StockIndex | pd.Se
     plt.tight_layout()
     plt.show()
 
-def most_recent_positions(stock_index: StockIndex, pattern: str = "*.csv") -> pd.Series:
+def most_recent_positions(stock_index: StockIndex, pattern: str = "*.csv", date: str = None) -> pd.Series:
     """
     Reads the most recent file positions for the region matching the file pattern and returns as a DataFrame.
     
@@ -277,9 +325,14 @@ def most_recent_positions(stock_index: StockIndex, pattern: str = "*.csv") -> pd
     if not files:
         raise FileNotFoundError(f"No files found in {TARGETS_DIR}/{stock_index.region} matching {pattern}")
     
+    if date:
+        files = [f for f in files if date.replace('-','') in f]
+        if len(files)==0:
+            raise FileNotFoundError(f"No submission for date: {date} exists")
+
     # Get the most recently added file
     most_recent_file = max(files, key=lambda f: Path(f).stat().st_mtime)
-    
+        
     # Read into DataFrame
     df = pd.read_csv(most_recent_file)
 
@@ -288,26 +341,38 @@ def most_recent_positions(stock_index: StockIndex, pattern: str = "*.csv") -> pd
     return df
 
 @lru_cache(maxsize=128)
-def eur_usd(date: str | None = None) -> float:
+def to_usd(curr: str = 'EUR', date: str | None = None) -> float:
     """
-    Get the current EURUSD exchange rate from Yahoo Finance.
+    Get the current curr x USD exchange rate from Yahoo Finance.
     
     Parameters:
+        curr (str): Currency code to exchange
         date (str): String date for the fx rate
     
     Returns:
         float: Exchange rate value
     """
+    curr = curr.upper()
     today = str(datetime.now().date()) if date is None else date
     fx_rate = yf.download(
-        "EURUSD=X", end=today, auto_adjust=True, progress=False
-    )['Close']['EURUSD=X'].iloc[-1]
+        f"{curr}USD=X", end=today, auto_adjust=True, progress=False
+    )['Close'][f'{curr}USD=X'].iloc[-1]
     return float(fx_rate)
 
 if __name__ == '__main__':
-    from qrt.constants import RUA
+    from qrt.constants import RUA, STOXX
 
+    pos_before = most_recent_positions(RUA, date='2026-04-01')
     pos = most_recent_positions(RUA)
-    print(pos.head())
-    print(len(pos.index))
+
+
+    print(portfolio_beta(pos_before, stock_index=RUA))
     print(portfolio_beta(pos, stock_index=RUA))
+
+    print(portfolio_beta(pos_before, stock_index=STOXX))
+    print(portfolio_beta(pos, stock_index=STOXX))
+
+    print(position_correlation(pos_before, pos, 60))
+    print(pos_before.corr(pos))
+
+
