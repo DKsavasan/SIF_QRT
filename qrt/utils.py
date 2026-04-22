@@ -365,9 +365,10 @@ def scale_portfolio_risk(
         weights_rua = pd.Series(dtype=float)
 
     currencies = get_data(
-        weights_rua.index.to_list()+weights_stoxx.index.to_list(), 
+        weights_rua.index.to_list() + weights_stoxx.index.to_list(), 
         fields=["CF_CURR"]
     ).drop_duplicates().set_index('Instrument')
+    currencies.loc[weights_rua.index, 'CF_CURR'] = 'USD'
     
     unique_currs = currencies['CF_CURR'].unique()
     fx_map = {c: to_usd(c) for c in unique_currs if c != 'USD'}
