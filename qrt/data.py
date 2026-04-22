@@ -85,6 +85,182 @@ def discovery_search(select="RIC,ISIN,TickerSymbol,DTSubjectName,IsPrimaryRIC", 
         ld.close_session()
 
 
+# ---------- Upsert Raw Price/Volume Data For All Constituents to Parquet Locally ---------- #
+
+def _chunk_list(lst, n):
+    """Yield successive n-sized chunks from lst."""
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
+
+def _fetch_chunk_with_retry(chunk, start_date, end_date, max_retry: int = 1, retry_delay: int = 30) -> pd.DataFrame:
+    """Fetch one chunk with retry on timeout / errors."""
+    for attempt in range(1, max_retry + 1):
+        try:
+            df = ld.get_history(
+                universe=chunk,
+                fields=DAILY_DATA_FIELDS,
+                start=start_date,
+                end=end_date,
+                interval="1d"
+            )
+            return df
+        except Exception as e:
+            if attempt < max_retry:
+                time.sleep(retry_delay)
+            else:
+                logger.warning(f"Skipping {chunk} after {max_retry} failed attempts", exc_info=e)
+                return pd.DataFrame()
+
+def _write_parquet_incremental(df, inst, sub_folder, inst_name='RIC', upsert=False) -> None:
+    """Append or create parquet file for a single instrument."""
+    folder = PRICE_DIR / sub_folder / f"{inst_name}={inst}"
+    folder.mkdir(parents=True, exist_ok=True)
+    file_path = folder / f"part.parquet"
+
+    # Keep only Date, Close, Volume
+    df = df[['Date', 'Close', 'Volume']]
+    if df.empty:
+        logger.warning(f"Empty data for {inst}")
+        return
+
+    if upsert and file_path.exists():
+        try:
+            existing = pq.read_table(file_path).to_pandas()
+            # Read existing parquet
+            existing = existing[[c for c in ['Date', 'Close', 'Volume'] if c in existing.columns]]
+
+            # Concatenate and drop duplicates (if any)
+            df = pd.concat([existing, df], ignore_index=True)
+            df.drop_duplicates(subset=['Date'], keep='last', inplace=True)
+            df.sort_values('Date', inplace=True)
+            df.reset_index(drop=True, inplace=True)
+        except Exception as e:
+            logger.warning(f"Could not read existing parquet {file_path}: {e}")
+
+    # Write to parquet
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    pq.write_table(table, file_path)
+
+def download_all_prices(instruments, sub_folder, start_date, end_date, inst_name='RIC', skip_existing=False, upsert=False, chunk_size=1, print_inst=False, sample_size=None) -> None:
+    ld.open_session()
+    c = 0
+    try:
+        for chunk in _chunk_list(instruments, chunk_size):
+            if skip_existing:
+                folder = PRICE_DIR / sub_folder / f"{inst_name}={chunk[0]}"
+                file_path = folder / "part.parquet"
+
+                if file_path.exists(): 
+                    logger.info(f"Skipped existing: {chunk[0]}")
+                    continue
+
+            df = _fetch_chunk_with_retry(chunk=chunk, start_date=start_date, end_date=end_date)
+            if df.empty:
+                logger.warning(f"Empty data: {chunk}")
+                continue
+            
+            if len(chunk) > 1:
+                # stack multi-RIC panel
+                df = df.stack(level=0, future_stack=True).reset_index()
+                df.rename(columns={'level_1': inst_name}, inplace=True)
+            else:
+                df[inst_name] = chunk[0]
+                df.reset_index(inplace=True)
+                df.columns.name = None
+            
+            df.rename(columns={'Price Close': 'Close'}, inplace=True)
+            df.sort_values([inst_name, 'Date'], inplace=True)
+            df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
+            df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
+            df['Date'] = pd.to_datetime(df['Date'])
+            df.dropna(subset=['Date'], inplace=True)
+            df.dropna(subset=['Close', 'Volume'], how='all', inplace=True)
+            df.reset_index(drop=True, inplace=True)
+
+            # write each instrument incrementally
+            for inst in df[inst_name].unique():
+                c+=1
+                if c % 1000 == 0:
+                    logger.info(f"Downloaded data for {c} stocks")
+                if print_inst:
+                    logger.info(inst) 
+                if c==sample_size:
+                    logger.info(f"Downloaded all data for sample size {c} stocks")
+                    return
+                inst_df = df[df[inst_name] == inst].copy()
+
+                _write_parquet_incremental(
+                    df=inst_df, inst=inst, sub_folder=sub_folder, inst_name=inst_name, upsert=upsert
+                )
+
+    finally:
+        ld.close_session()
+
+def save_fundamental_data(instruments: list, sub_folder: str, start_date: str = '2000-01-01', inst_name: str = 'RIC', batch: int = 10, sample_size: int = None, skip_existing: bool = False, upsert: bool = True, max_retries: int = 3):
+    """
+    Rewrites all fundamentals data for the specified instruments.
+    """
+    logger.info(f"Fetching fundamental data for {len(instruments)} {inst_name}'s...")
+    existing_insts = set()
+    (FUNDAMENTALS_DIR / sub_folder).mkdir(parents=True, exist_ok=True)
+    for f in (FUNDAMENTALS_DIR / sub_folder).iterdir():
+        assert f.name.startswith(f"{inst_name}="), f"Unexpected file in folder: {f}"
+        existing_insts.add(f.name.split(f"{inst_name}=")[1])
+
+    c=0
+    for instrument_chunk in _chunk_list(instruments, batch):
+
+        if skip_existing:
+            instrument_chunk = [inst for inst in instrument_chunk if inst not in existing_insts]
+            if not instrument_chunk:
+                continue
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                df = get_history(instrument_chunk, fields=FUNDAMENTAL_METRICS_QUARTERLY, start=start_date)
+                break
+            except Exception as e:
+                if attempt < max_retries:
+                    logger.warning(f"Attempt {attempt} failed for {instrument_chunk}: {e}. Retrying in 30s...")
+                    time.sleep(30)
+                else:
+                    logger.error(f"All {max_retries} attempts failed for {instrument_chunk}: {e}")
+                    continue
+
+        instrument_cols = df.columns.levels[0] if isinstance(df.columns, pd.MultiIndex) else instrument_chunk
+        df = df.apply(pd.to_numeric, errors='coerce')
+
+        for inst in instrument_cols:
+            inst_df = df[inst] if isinstance(df.columns, pd.MultiIndex) else df
+            if inst_df.empty:
+                continue
+            inst_df.index = inst_df.index.date
+            inst_df = inst_df.groupby(inst_df.index).last()
+            inst_df = inst_df.dropna(how='all')
+            inst_df.sort_index(inplace=True)
+
+            folder = FUNDAMENTALS_DIR / sub_folder / f"{inst_name}={inst}"
+            folder.mkdir(parents=True, exist_ok=True)
+            file_path = folder / f"part.parquet"
+
+            # Upsert
+            if upsert and file_path.exists():
+                existing = pd.read_parquet(file_path)
+                inst_df = pd.concat([existing, inst_df])
+                inst_df = inst_df[~inst_df.index.duplicated(keep='last')]
+                inst_df.sort_index(inplace=True)
+
+            table = pa.Table.from_pandas(inst_df)
+            pq.write_table(table, file_path)
+            c+=1
+            if c==sample_size:
+                logger.info(f"Downloaded fundamental data for sample size {c} stocks")
+                return
+            
+        if c%batch == 0:
+            logger.info(f"Downloaded fundamental data for {c} stocks. This chunk: {instrument_chunk}")
+
+
 # ---------- Save Index Constituents: Historical and Tradeable ---------- #
 
 def _parse_bloomberg_export(folder: str) -> pd.DataFrame:
@@ -296,182 +472,6 @@ def get_lseg_active_constituents(has_data: bool = True) -> pd.DataFrame:
     """
     df = pd.read_csv(DATA_DIR / LSEG_ACTIVE_CONSTITUENTS_FILE)
     return df[df.HasLsegData==has_data]
-
-
-# ---------- Upsert Raw Price/Volume Data For All Constituents to Parquet Locally ---------- #
-
-def _chunk_list(lst, n):
-    """Yield successive n-sized chunks from lst."""
-    for i in range(0, len(lst), n):
-        yield lst[i:i+n]
-
-def _fetch_chunk_with_retry(chunk, start_date, end_date, max_retry: int = 1, retry_delay: int = 30) -> pd.DataFrame:
-    """Fetch one chunk with retry on timeout / errors."""
-    for attempt in range(1, max_retry + 1):
-        try:
-            df = ld.get_history(
-                universe=chunk,
-                fields=DAILY_DATA_FIELDS,
-                start=start_date,
-                end=end_date,
-                interval="1d"
-            )
-            return df
-        except Exception as e:
-            if attempt < max_retry:
-                time.sleep(retry_delay)
-            else:
-                logger.warning(f"Skipping {chunk} after {max_retry} failed attempts", exc_info=e)
-                return pd.DataFrame()
-
-def _write_parquet_incremental(df, inst, sub_folder, inst_name='RIC', upsert=False) -> None:
-    """Append or create parquet file for a single instrument."""
-    folder = PRICE_DIR / sub_folder / f"{inst_name}={inst}"
-    folder.mkdir(parents=True, exist_ok=True)
-    file_path = folder / f"part.parquet"
-
-    # Keep only Date, Close, Volume
-    df = df[['Date', 'Close', 'Volume']]
-    if df.empty:
-        logger.warning(f"Empty data for {inst}")
-        return
-
-    if upsert and file_path.exists():
-        try:
-            existing = pq.read_table(file_path).to_pandas()
-            # Read existing parquet
-            existing = existing[[c for c in ['Date', 'Close', 'Volume'] if c in existing.columns]]
-
-            # Concatenate and drop duplicates (if any)
-            df = pd.concat([existing, df], ignore_index=True)
-            df.drop_duplicates(subset=['Date'], keep='last', inplace=True)
-            df.sort_values('Date', inplace=True)
-            df.reset_index(drop=True, inplace=True)
-        except Exception as e:
-            logger.warning(f"Could not read existing parquet {file_path}: {e}")
-
-    # Write to parquet
-    table = pa.Table.from_pandas(df, preserve_index=False)
-    pq.write_table(table, file_path)
-
-def download_all_prices(instruments, sub_folder, start_date, end_date, inst_name='RIC', skip_existing=False, upsert=False, chunk_size=1, print_inst=False, sample_size=None) -> None:
-    ld.open_session()
-    c = 0
-    try:
-        for chunk in _chunk_list(instruments, chunk_size):
-            if skip_existing:
-                folder = PRICE_DIR / sub_folder / f"{inst_name}={chunk[0]}"
-                file_path = folder / "part.parquet"
-
-                if file_path.exists(): 
-                    logger.info(f"Skipped existing: {chunk[0]}")
-                    continue
-
-            df = _fetch_chunk_with_retry(chunk=chunk, start_date=start_date, end_date=end_date)
-            if df.empty:
-                logger.warning(f"Empty data: {chunk}")
-                continue
-            
-            if len(chunk) > 1:
-                # stack multi-RIC panel
-                df = df.stack(level=0, future_stack=True).reset_index()
-                df.rename(columns={'level_1': inst_name}, inplace=True)
-            else:
-                df[inst_name] = chunk[0]
-                df.reset_index(inplace=True)
-                df.columns.name = None
-            
-            df.rename(columns={'Price Close': 'Close'}, inplace=True)
-            df.sort_values([inst_name, 'Date'], inplace=True)
-            df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
-            df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
-            df['Date'] = pd.to_datetime(df['Date'])
-            df.dropna(subset=['Date'], inplace=True)
-            df.dropna(subset=['Close', 'Volume'], how='all', inplace=True)
-            df.reset_index(drop=True, inplace=True)
-
-            # write each instrument incrementally
-            for inst in df[inst_name].unique():
-                c+=1
-                if c % 1000 == 0:
-                    logger.info(f"Downloaded data for {c} stocks")
-                if print_inst:
-                    logger.info(inst) 
-                if c==sample_size:
-                    logger.info(f"Downloaded all data for sample size {c} stocks")
-                    return
-                inst_df = df[df[inst_name] == inst].copy()
-
-                _write_parquet_incremental(
-                    df=inst_df, inst=inst, sub_folder=sub_folder, inst_name=inst_name, upsert=upsert
-                )
-
-    finally:
-        ld.close_session()
-
-def save_fundamental_data(instruments: list, sub_folder: str, start_date: str = '2000-01-01', inst_name: str = 'RIC', batch: int = 10, sample_size: int = None, skip_existing: bool = False, upsert: bool = True, max_retries: int = 3):
-    """
-    Rewrites all fundamentals data for the specified instruments.
-    """
-    logger.info(f"Fetching fundamental data for {len(instruments)} {inst_name}'s...")
-    existing_insts = set()
-    (FUNDAMENTALS_DIR / sub_folder).mkdir(parents=True, exist_ok=True)
-    for f in (FUNDAMENTALS_DIR / sub_folder).iterdir():
-        assert f.name.startswith(f"{inst_name}="), f"Unexpected file in folder: {f}"
-        existing_insts.add(f.name.split(f"{inst_name}=")[1])
-
-    c=0
-    for instrument_chunk in _chunk_list(instruments, batch):
-
-        if skip_existing:
-            instrument_chunk = [inst for inst in instrument_chunk if inst not in existing_insts]
-            if not instrument_chunk:
-                continue
-
-        for attempt in range(1, max_retries + 1):
-            try:
-                df = get_history(instrument_chunk, fields=FUNDAMENTAL_METRICS_QUARTERLY, start=start_date)
-                break
-            except Exception as e:
-                if attempt < max_retries:
-                    logger.warning(f"Attempt {attempt} failed for {instrument_chunk}: {e}. Retrying in 30s...")
-                    time.sleep(30)
-                else:
-                    logger.error(f"All {max_retries} attempts failed for {instrument_chunk}: {e}")
-                    continue
-
-        instrument_cols = df.columns.levels[0] if isinstance(df.columns, pd.MultiIndex) else instrument_chunk
-        df = df.apply(pd.to_numeric, errors='coerce')
-
-        for inst in instrument_cols:
-            inst_df = df[inst] if isinstance(df.columns, pd.MultiIndex) else df
-            if inst_df.empty:
-                continue
-            inst_df.index = inst_df.index.date
-            inst_df = inst_df.groupby(inst_df.index).last()
-            inst_df = inst_df.dropna(how='all')
-            inst_df.sort_index(inplace=True)
-
-            folder = FUNDAMENTALS_DIR / sub_folder / f"{inst_name}={inst}"
-            folder.mkdir(parents=True, exist_ok=True)
-            file_path = folder / f"part.parquet"
-
-            # Upsert
-            if upsert and file_path.exists():
-                existing = pd.read_parquet(file_path)
-                inst_df = pd.concat([existing, inst_df])
-                inst_df = inst_df[~inst_df.index.duplicated(keep='last')]
-                inst_df.sort_index(inplace=True)
-
-            table = pa.Table.from_pandas(inst_df)
-            pq.write_table(table, file_path)
-            c+=1
-            if c==sample_size:
-                logger.info(f"Downloaded fundamental data for sample size {c} stocks")
-                return
-            
-        if c%batch == 0:
-            logger.info(f"Downloaded fundamental data for {c} stocks. This chunk: {instrument_chunk}")
 
 
 # ---------- Download All Data ----------

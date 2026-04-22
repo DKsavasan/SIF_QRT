@@ -198,6 +198,9 @@ def risk(positions: pd.Series, date: str = None, data_type: DataType = 'active')
     """
     if date is None:
         date = pd.Timestamp.now().strftime("%Y-%m-%d")
+    
+    if positions.empty:
+        raise ValueError("No positions data")
 
     date = pd.Timestamp(date)
     config = DATA_CONFIG[data_type]
@@ -205,9 +208,14 @@ def risk(positions: pd.Series, date: str = None, data_type: DataType = 'active')
     returns = []
     # Last 60 trading days of position returns
     for ric in positions.index:
-        df = pd.read_parquet(
-            PRICE_DIR / config['sub_dir'] / f"{config['inst_name']}={ric}"
-        ).set_index("Date")[['Close']]
+        try:
+            df = pd.read_parquet(
+                PRICE_DIR / config['sub_dir'] / f"{config['inst_name']}={ric}"
+            ).set_index("Date")[['Close']]
+        except FileNotFoundError:
+            print("Skipped: ", ric, ' position:', round(positions[ric]))
+            positions.pop(ric)
+            continue
         df.index = pd.to_datetime(df.index)
         df = df[~df.index.duplicated(keep='first')].dropna()
 
@@ -222,7 +230,7 @@ def risk(positions: pd.Series, date: str = None, data_type: DataType = 'active')
 
     return float(daily_pnl.std(ddof=1) * np.sqrt(252))
 
-def load_returns_from(insts: pd.Index | list, start: str = '2026-01-01', data_type: DataType = 'active') -> pd.DataFrame:
+def load_returns_from(insts: pd.Index | list, start: str = '2026-04-01', data_type: DataType = 'active') -> pd.DataFrame:
     """Get daily returns DataFrame from local data, one column per Instrument
     Parameters:
         insts: List of Instrument's to fetch price data for.
@@ -262,7 +270,7 @@ def load_returns_from(insts: pd.Index | list, start: str = '2026-01-01', data_ty
 
     return returns_df
 
-def plot_portfolio_returns(positions: pd.Series, stock_index: StockIndex | pd.Series, start_date: str = '2026-01-01', data_type: DataType = 'active', figsize=(10, 3)):
+def plot_portfolio_returns(positions: pd.Series, stock_index: StockIndex | pd.Series, start_date: str = '2026-04-01', data_type: DataType = 'active', figsize=(10, 3)):
     """Plot cumulative portfolio returns (%) since start_date.
 
     Parameters:
@@ -340,6 +348,21 @@ def most_recent_positions(stock_index: StockIndex, pattern: str = "*.csv", date:
 
     return df
 
+def current_real_positions(stock_index: StockIndex = None, drop_missing=False):
+    folder = TARGETS_DIR / "QRT"
+    latest = max(folder.glob("QSec_Detailed_ICL05_*.xlsx"))
+    df = pd.read_excel(latest, sheet_name='Sheet1')
+    if stock_index is not None:
+        df = df[df['Book ID'] == f'ICL05_{stock_index.region}']
+    positions = df.set_index('Instrument')['Position EOD USD']
+    positions = positions[positions != 0]
+
+    if drop_missing:
+        has_data = positions.index.map(lambda ric: (PRICE_DIR / 'active_lseg' / f'RIC={ric}').exists())
+        positions = positions[has_data]
+
+    return positions
+
 @lru_cache(maxsize=128)
 def to_usd(curr: str = 'EUR', date: str | None = None) -> float:
     """
@@ -362,17 +385,17 @@ def to_usd(curr: str = 'EUR', date: str | None = None) -> float:
 if __name__ == '__main__':
     from qrt.constants import RUA, STOXX
 
-    pos_before = most_recent_positions(RUA, date='2026-04-01')
-    pos = most_recent_positions(RUA)
+    # pos_before = most_recent_positions(RUA, date='2026-04-01')
+    # pos = most_recent_positions(RUA)
 
 
-    print(portfolio_beta(pos_before, stock_index=RUA))
-    print(portfolio_beta(pos, stock_index=RUA))
+    # print(portfolio_beta(pos_before, stock_index=RUA))
+    # print(portfolio_beta(pos, stock_index=RUA))
 
-    print(portfolio_beta(pos_before, stock_index=STOXX))
-    print(portfolio_beta(pos, stock_index=STOXX))
+    # print(portfolio_beta(pos_before, stock_index=STOXX))
+    # print(portfolio_beta(pos, stock_index=STOXX))
 
-    print(position_correlation(pos_before, pos, 60))
-    print(pos_before.corr(pos))
-
+    # print(position_correlation(pos_before, pos, 60))
+    # print(pos_before.corr(pos))
+    
 
